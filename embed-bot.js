@@ -58,7 +58,8 @@ function processMessage(content) {
   };
 }
 
-// Pulls the direct video/photo URL for a tweet via the fxtwitter API (fixupx.com's backend)
+// Pulls the direct video URL for a tweet via the fxtwitter API (fixupx.com's backend).
+// Image-only tweets return null so no download button shows up for them.
 async function getTwitterDownloadUrl(url) {
   const idMatch = url.match(/status\/(\d+)/);
   if (!idMatch) return null;
@@ -68,8 +69,7 @@ async function getTwitterDownloadUrl(url) {
     if (!res.ok) return null;
 
     const data = await res.json();
-    const media = data?.tweet?.media;
-    return media?.videos?.[0]?.url ?? media?.photos?.[0]?.url ?? null;
+    return data?.tweet?.media?.videos?.[0]?.url ?? null;
   } catch {
     return null;
   }
