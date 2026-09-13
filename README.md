@@ -98,6 +98,10 @@ npm run dev
 - Ensure links are in standard format (e.g., `https://x.com/...`)
 - Some shortened or non-standard URLs may not be detected
 
+## Credits
+
+Bot icon: [Halloween icons created by Tiemcuala - Flaticon](https://www.flaticon.com/packs/halloween-18118697)
+
 ## License
 
 MIT
