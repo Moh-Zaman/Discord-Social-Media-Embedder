@@ -1,4 +1,11 @@
-const { Client, GatewayIntentBits, ChannelType } = require('discord.js');
+const {
+  Client,
+  GatewayIntentBits,
+  ChannelType,
+  ButtonBuilder,
+  ButtonStyle,
+  ActionRowBuilder,
+} = require('discord.js');
 require('dotenv').config();
 
 const client = new Client({
@@ -32,32 +39,40 @@ function convertInstagramLink(url) {
 
 // Function to find and convert social media links
 function processMessage(content) {
+  const twitterMatches = [...content.matchAll(TWITTER_REGEX)].map((m) => m[0]);
+  const instagramMatches = [...content.matchAll(INSTAGRAM_REGEX)].map((m) => m[0]);
+
   let processedContent = content;
-  let hasTwitter = false;
-  let hasInstagram = false;
-
-  // Check for Twitter/X links
-  if (TWITTER_REGEX.test(content)) {
-    hasTwitter = true;
-    processedContent = processedContent.replace(TWITTER_REGEX, (match) => {
-      return convertTwitterLink(match);
-    });
+  if (twitterMatches.length) {
+    processedContent = processedContent.replace(TWITTER_REGEX, convertTwitterLink);
   }
-
-  // Check for Instagram links
-  if (INSTAGRAM_REGEX.test(processedContent)) {
-    hasInstagram = true;
-    processedContent = processedContent.replace(INSTAGRAM_REGEX, (match) => {
-      return convertInstagramLink(match);
-    });
+  if (instagramMatches.length) {
+    processedContent = processedContent.replace(INSTAGRAM_REGEX, convertInstagramLink);
   }
 
   return {
     processed: processedContent,
-    modified: hasTwitter || hasInstagram,
-    hasTwitter,
-    hasInstagram,
+    modified: twitterMatches.length > 0 || instagramMatches.length > 0,
+    twitterMatches,
+    instagramMatches,
   };
+}
+
+// Pulls the direct video/photo URL for a tweet via the fxtwitter API (fixupx.com's backend)
+async function getTwitterDownloadUrl(url) {
+  const idMatch = url.match(/status\/(\d+)/);
+  if (!idMatch) return null;
+
+  try {
+    const res = await fetch(`https://api.fxtwitter.com/status/${idMatch[1]}`);
+    if (!res.ok) return null;
+
+    const data = await res.json();
+    const media = data?.tweet?.media;
+    return media?.videos?.[0]?.url ?? media?.photos?.[0]?.url ?? null;
+  } catch {
+    return null;
+  }
 }
 
 client.on('ready', () => {
@@ -87,14 +102,30 @@ client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
   if (message.channel.type === ChannelType.DM) return;
 
-  const { processed, modified } = processMessage(message.content);
+  const { processed, modified, twitterMatches } = processMessage(message.content);
 
   // Only act if we found and modified social media links
   if (modified) {
+    const downloadUrl = twitterMatches.length
+      ? await getTwitterDownloadUrl(twitterMatches[0])
+      : null;
+
     try {
       const isThread = message.channel.isThread();
       const webhookChannel = isThread ? message.channel.parent : message.channel;
       const webhook = await getWebhook(webhookChannel);
+
+      const components = downloadUrl
+        ? [
+            new ActionRowBuilder().addComponents(
+              new ButtonBuilder()
+                .setStyle(ButtonStyle.Link)
+                .setURL(downloadUrl)
+                .setEmoji('⬇️')
+                .setLabel('Download')
+            ),
+          ]
+        : [];
 
       await message.delete();
 
@@ -105,6 +136,7 @@ client.on('messageCreate', async (message) => {
         avatarURL: message.author.displayAvatarURL(),
         threadId: isThread ? message.channel.id : undefined,
         allowedMentions: { parse: [] },
+        components,
       });
     } catch (error) {
       console.error('Error processing message:', error);
