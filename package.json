@@ -1,0 +1,26 @@
+{
+  "name": "embed-bot",
+  "version": "1.0.0",
+  "description": "Discord bot that rewrites Twitter/X and Instagram links with proxy services for better embeds",
+  "main": "embed-bot.js",
+  "scripts": {
+    "start": "node embed-bot.js",
+    "dev": "nodemon embed-bot.js"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "twitter",
+    "instagram",
+    "embed"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "discord.js": "^14.14.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
