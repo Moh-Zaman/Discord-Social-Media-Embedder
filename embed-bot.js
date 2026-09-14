@@ -91,10 +91,34 @@ const EMPTY_TWEET_INFO = {
   communityNote: null,
 };
 
+// Builds the { duration, variants, bestUrl } shape used for both a tweet's own video and a
+// quoted tweet's video, from the fxtwitter API's raw video object.
+function parseVideo(video) {
+  if (!video) return null;
+  const mp4Variants = (video.formats ?? [])
+    .filter((f) => f.container === 'mp4' && typeof f.bitrate === 'number')
+    .sort((a, b) => b.bitrate - a.bitrate);
+  return { duration: video.duration ?? null, variants: mp4Variants, bestUrl: video.url };
+}
+
+// Spells out a raw ISO 639-1 code ("ja") as a full language name ("Japanese"), for the quote
+// translation fallback (its translation object doesn't reliably carry the API's own English
+// name the way the outer tweet's does — see getTweetInfo). Built into Node's Intl support, no
+// dependency needed. Falls back to the raw code itself for anything it doesn't recognize.
+const languageDisplayNames = new Intl.DisplayNames(['en'], { type: 'language' });
+function getLanguageName(code) {
+  if (!code) return null;
+  try {
+    return languageDisplayNames.of(code) ?? code;
+  } catch {
+    return code;
+  }
+}
+
 // Pulls tweet info via the fxtwitter API (fixupx.com's backend): the tweet text, an English
 // translation (fxtwitter translates server-side and only returns a `translation` field when
 // the tweet isn't already in English), video variants (for picking one small enough to attach
-// natively), photos, author, stats, and quoted-tweet text if this tweet quotes another one.
+// natively), photos, author, stats, and quoted-tweet text/media if this tweet quotes another one.
 async function getTweetInfo(url) {
   const idMatch = url.match(/status\/(\d+)/);
   if (!idMatch) return EMPTY_TWEET_INFO;
@@ -107,17 +131,12 @@ async function getTweetInfo(url) {
     const tweet = data?.tweet;
     if (!tweet) return EMPTY_TWEET_INFO;
 
-    const video = tweet.media?.videos?.[0] ?? null;
-    const mp4Variants = (video?.formats ?? [])
-      .filter((f) => f.container === 'mp4' && typeof f.bitrate === 'number')
-      .sort((a, b) => b.bitrate - a.bitrate);
-
     return {
       text: tweet.text ?? '',
       translation: tweet.translation
         ? { text: tweet.translation.text, sourceLang: tweet.translation.source_lang_en }
         : null,
-      video: video ? { duration: video.duration ?? null, variants: mp4Variants, bestUrl: video.url } : null,
+      video: parseVideo(tweet.media?.videos?.[0]),
       photos: tweet.media?.photos?.map((p) => p.url) ?? [],
       author: tweet.author
         ? {
@@ -129,15 +148,34 @@ async function getTweetInfo(url) {
         : null,
       stats: { likes: tweet.likes ?? 0, retweets: tweet.retweets ?? 0, replies: tweet.replies ?? 0 },
       tweetUrl: tweet.url ?? null,
-      quote:
-        tweet.quote && tweet.quote.text
-          ? {
-              text: tweet.quote.text,
-              author: tweet.quote.author
-                ? { name: tweet.quote.author.name, screenName: tweet.quote.author.screen_name }
-                : null,
-            }
-          : null,
+      // Checked against tweet.quote (not tweet.quote.text) so a quote-tweet whose quoted post is
+      // media-only (an image/video/gif with no caption) still registers as a quote instead of
+      // being silently dropped, and its media carries over via the same photos/video shape as
+      // the outer tweet. The quote's own translation field is wired up on the same defensive
+      // basis as communityNote below: FxEmbed's API docs describe `quote` as reusing the exact
+      // same schema as the outer tweet (which does carry translation), but this wasn't
+      // confirmed against a live non-English quoted tweet, so treat it as likely-but-unverified.
+      quote: tweet.quote
+        ? {
+            text: tweet.quote.text ?? '',
+            // The quote's translation object doesn't reliably carry source_lang_en the way the
+            // outer tweet's does (confirmed live: it came back undefined) — fall back to the
+            // raw source_lang code, and to null (rendered as just "Translated", no "from X") if
+            // even that's missing, rather than ever showing a literal "undefined".
+            translation: tweet.quote.translation
+              ? {
+                  text: tweet.quote.translation.text,
+                  sourceLang:
+                    tweet.quote.translation.source_lang_en ?? getLanguageName(tweet.quote.translation.source_lang),
+                }
+              : null,
+            author: tweet.quote.author
+              ? { name: tweet.quote.author.name, screenName: tweet.quote.author.screen_name }
+              : null,
+            photos: tweet.quote.media?.photos?.map((p) => p.url) ?? [],
+            video: parseVideo(tweet.quote.media?.videos?.[0]),
+          }
+        : null,
       createdTimestamp: tweet.created_timestamp ?? null,
       // possibly_sensitive is what the API calls it; not currently confirmed to ever be
       // populated with real community-note content (see comment on buildTweetContainer).
@@ -228,12 +266,12 @@ function formatCompact(n) {
 // --- Custom Components v2 card (replaces the fixupx.com native embed) ---
 
 // One Container per tweet: author (name/avatar), body text (translated text takes priority
-// over the original), quoted-tweet text if this is a quote-tweet, media (a native video
-// attachment or the tweet's photos), stats, and action buttons. `videoAttachment` is passed
-// in separately (rather than looked up from `info`) because it's already been downloaded by
-// the time this runs, and referencing an attachment by filename is how Components v2 embeds
-// an uploaded file into a MediaGallery.
-function buildTweetContainer(info, videoAttachment) {
+// over the original), quoted-tweet text and media if this is a quote-tweet, the tweet's own
+// media (a native video attachment or its photos), stats, and action buttons. `videoAttachment`
+// and `quoteVideoAttachment` are passed in separately (rather than looked up from `info`)
+// because they're already been downloaded by the time this runs, and referencing an attachment
+// by filename is how Components v2 embeds an uploaded file into a MediaGallery.
+function buildTweetContainer(info, videoAttachment, quoteVideoAttachment) {
   const container = new ContainerBuilder().setAccentColor(0x1d9bf0);
   const isEnriched = Boolean(info.author);
 
@@ -269,7 +307,35 @@ function buildTweetContainer(info, videoAttachment) {
     const quoteHeader = info.quote.author
       ? `**Quoting [@${info.quote.author.screenName}](https://x.com/${info.quote.author.screenName}):**`
       : '**Quoting:**';
-    container.addTextDisplayComponents(new TextDisplayBuilder().setContent(`${quoteHeader}\n${info.quote.text}`));
+    // Translated quote text takes priority over the original, same as the tweet's own body.
+    // Media-only quotes (an image/video/gif with no caption) have no text to append at all.
+    const quoteText = info.quote.translation ? info.quote.translation.text : info.quote.text;
+    container.addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(quoteText ? `${quoteHeader}\n${quoteText}` : quoteHeader)
+    );
+    if (info.quote.translation) {
+      const quoteTranslationNote = info.quote.translation.sourceLang
+        ? `-# 🌐 Translated from ${info.quote.translation.sourceLang}`
+        : '-# 🌐 Translated';
+      container.addTextDisplayComponents(new TextDisplayBuilder().setContent(quoteTranslationNote));
+    }
+
+    // Quoted media is spoiler-tagged the same as the tweet's own media (see below) — we don't
+    // get a separate sensitivity flag for the quoted tweet from the API, so this reuses the
+    // outer tweet's flag as the closest available signal.
+    if (quoteVideoAttachment) {
+      container.addMediaGalleryComponents(
+        new MediaGalleryBuilder().addItems(
+          new MediaGalleryItemBuilder().setURL(`attachment://${quoteVideoAttachment.name}`).setSpoiler(info.sensitive)
+        )
+      );
+    } else if (info.quote.photos.length) {
+      const quoteGallery = new MediaGalleryBuilder();
+      for (const photoUrl of info.quote.photos.slice(0, 4)) {
+        quoteGallery.addItems(new MediaGalleryItemBuilder().setURL(photoUrl).setSpoiler(info.sensitive));
+      }
+      container.addMediaGalleryComponents(quoteGallery);
+    }
   }
 
   // Sensitive media is spoiler-tagged (blurred, click-to-reveal) rather than shown openly,
@@ -322,16 +388,22 @@ function buildTweetContainer(info, videoAttachment) {
 }
 
 // Builds one container per tweet, downloading a video attachment where needed. Returns
-// { ok: false } the moment any tweet's video can't fit under the size cap (even at its lowest
-// available quality, or the real download turned out bigger than estimated) — callers should
-// fall back to the plain-link approach for the whole message in that case, since a
+// { ok: false } the moment the tweet's own video can't fit under the size cap (even at its
+// lowest available quality, or the real download turned out bigger than estimated) — callers
+// should fall back to the plain-link approach for the whole message in that case, since a
 // Components-v2 message can't be partially built.
+//
+// A quoted tweet's video is treated as supplementary rather than essential: it's only attached
+// if it fits in whatever budget is left after the tweet's own video, and if it doesn't fit (or
+// there's no budget left at all), it's just silently skipped — the quote's text/photos and the
+// rest of the card still go out normally rather than failing the whole message over it.
 async function buildTweetCards(tweetInfos, sizeCap) {
   const containers = [];
   const files = [];
 
   for (const [i, info] of tweetInfos.entries()) {
     let videoAttachment = null;
+    let usedBytes = 0;
 
     if (info.video) {
       const variant = pickVideoVariant(info.video, sizeCap);
@@ -341,9 +413,20 @@ async function buildTweetCards(tweetInfos, sizeCap) {
       if (!videoAttachment) return { ok: false };
 
       files.push(videoAttachment);
+      usedBytes = videoAttachment.attachment.length;
     }
 
-    containers.push(buildTweetContainer(info, videoAttachment));
+    let quoteVideoAttachment = null;
+    if (info.quote?.video) {
+      const remainingBudget = sizeCap - usedBytes;
+      const quoteVariant = remainingBudget > 0 ? pickVideoVariant(info.quote.video, remainingBudget) : null;
+      if (quoteVariant) {
+        quoteVideoAttachment = await downloadVideoAttachment(quoteVariant.url, remainingBudget, `tweet-quote-video-${i}.mp4`);
+        if (quoteVideoAttachment) files.push(quoteVideoAttachment);
+      }
+    }
+
+    containers.push(buildTweetContainer(info, videoAttachment, quoteVideoAttachment));
   }
 
   return { ok: true, containers, files };
@@ -380,8 +463,18 @@ function formatTranslationBlock(translation) {
   );
 }
 
-function buildTranslationEmbeds({ translation, author, photos, stats, tweetUrl, createdTimestamp, communityNote }) {
+function buildTranslationEmbeds({ translation, author, photos, stats, tweetUrl, createdTimestamp, communityNote, quote }) {
   let description = translation.text;
+  if (quote) {
+    const quoteHeader = quote.author ? `**Quoting @${quote.author.screenName}:**` : '**Quoting:**';
+    const quoteText = quote.translation ? quote.translation.text : quote.text;
+    description += quoteText ? `\n\n${quoteHeader}\n${quoteText}` : `\n\n${quoteHeader}`;
+    if (quote.translation) {
+      description += quote.translation.sourceLang
+        ? `\n-# 🌐 Translated from ${quote.translation.sourceLang}`
+        : '\n-# 🌐 Translated';
+    }
+  }
   if (communityNote) description += `\n\n📝 **Community Note:** ${communityNote}`;
 
   const main = new EmbedBuilder()
@@ -400,9 +493,12 @@ function buildTranslationEmbeds({ translation, author, photos, stats, tweetUrl, 
   }
   // Legacy Embeds don't support spoiler-tagging images, unlike the Components-v2 card, so
   // sensitive photos here are shown openly — a known, accepted gap for this rare fallback path.
-  if (photos[0]) main.setImage(photos[0]);
+  // Quote video can't be carried over here either (embeds have no video support at all); own
+  // and quoted photos are combined into one gallery rather than visually separated.
+  const allPhotos = [...photos, ...(quote?.photos ?? [])];
+  if (allPhotos[0]) main.setImage(allPhotos[0]);
 
-  const galleryEmbeds = photos.slice(1, 4).map((photoUrl) => new EmbedBuilder().setURL(tweetUrl ?? undefined).setImage(photoUrl));
+  const galleryEmbeds = allPhotos.slice(1, 4).map((photoUrl) => new EmbedBuilder().setURL(tweetUrl ?? undefined).setImage(photoUrl));
 
   return [main, ...galleryEmbeds];
 }
