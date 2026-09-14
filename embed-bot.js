@@ -14,6 +14,9 @@ const {
   AttachmentBuilder,
   MessageFlags,
   RESTJSONErrorCodes,
+  SlashCommandBuilder,
+  ApplicationIntegrationType,
+  InteractionContextType,
 } = require('discord.js');
 require('dotenv').config();
 
@@ -562,11 +565,6 @@ function buildFallbackPayload(rewrittenContent, tweetInfos) {
   return { content: content || undefined, embeds, components };
 }
 
-client.on('ready', () => {
-  console.log(`✅ Bot logged in as ${client.user.tag}`);
-  client.user.setActivity('for social media links', { type: 'WATCHING' });
-});
-
 // One webhook per channel, reused so we don't create a new one for every message
 const webhookCache = new Map();
 
@@ -603,91 +601,169 @@ async function sendViaWebhook(channel, payload) {
   }
 }
 
+// Shared by messageCreate and the /fix slash command: given raw text containing supported
+// links, does everything async (tweet lookups, video downloads) needed to build a response.
+// Returns null if nothing supported was found. Kept separate from the final payload/send step
+// since the two callers send the result differently (webhook impersonation vs. an interaction
+// reply) and need different retry behavior around it.
+async function prepareLinkResponse(rawContent, guild) {
+  const { matchesByRule, twitterMatches, modified } = findLinks(rawContent);
+  if (!modified) return null;
+
+  let rewritten = rawContent;
+  for (const { rule, matches } of matchesByRule) {
+    if (rule.name === 'twitter' || !matches.length) continue;
+    rewritten = rewritten.replace(rule.regex, rule.convert);
+  }
+
+  // Messages/links with no tweet at all (just Instagram/TikTok/Bluesky) skip the whole
+  // card/fallback system — those platforms already work fine via native unfurl and aren't part
+  // of this feature, and Components-v2 text isn't confirmed to auto-unfurl links the way normal
+  // content does.
+  const hasTweet = twitterMatches.length > 0;
+  const tweetInfos = hasTweet ? await getTweetInfoForMatches(twitterMatches) : [];
+  const sizeCap = getAttachmentSizeCap(guild);
+  const cardResult = hasTweet ? await buildTweetCards(tweetInfos, sizeCap) : null;
+
+  return { matchesByRule, rewritten, hasTweet, tweetInfos, cardResult };
+}
+
+// The primary (best-case) payload for a prepared response: the rich Components-v2 card for
+// tweets, or a plain domain-swapped link for everything else. Throws/produces cardResult.ok ===
+// false when a tweet's video couldn't be attached — callers should use buildFallbackPayload
+// instead in that case (see prepareLinkResponse's cardResult).
+function buildPrimaryPayload({ matchesByRule, rewritten, hasTweet, cardResult }) {
+  if (!hasTweet) return { content: rewritten };
+
+  const extraLinks = buildExtraLinksContainer(matchesByRule);
+  return {
+    flags: MessageFlags.IsComponentsV2,
+    components: extraLinks ? [...cardResult.containers, extraLinks] : cardResult.containers,
+    files: cardResult.files,
+  };
+}
+
 client.on('messageCreate', async (message) => {
   // Ignore bot messages and DMs
   if (message.author.bot) return;
   if (message.channel.type === ChannelType.DM) return;
 
-  const { matchesByRule, twitterMatches, modified } = findLinks(message.content);
+  const prepared = await prepareLinkResponse(message.content, message.guild);
+  if (!prepared) return;
+  const { rewritten, hasTweet, tweetInfos, cardResult } = prepared;
 
-  // Only act if we found and modified social media links
-  if (modified) {
-    const tweetInfos = await getTweetInfoForMatches(twitterMatches);
+  try {
+    const isThread = message.channel.isThread();
+    const webhookChannel = isThread ? message.channel.parent : message.channel;
+    const threadId = isThread ? message.channel.id : undefined;
 
+    const identity = {
+      username: message.member?.displayName ?? message.author.username,
+      avatarURL: message.author.displayAvatarURL(),
+      threadId,
+      allowedMentions: { parse: [] },
+    };
+
+    // Send the replacement first and only delete the original once it's confirmed posted —
+    // otherwise a failed send would silently wipe the user's message with nothing to show
+    // for it.
     try {
-      const isThread = message.channel.isThread();
-      const webhookChannel = isThread ? message.channel.parent : message.channel;
-      const threadId = isThread ? message.channel.id : undefined;
-
-      // Non-Twitter links just get their plain domain swap; Twitter links go through the
-      // card-building pipeline below.
-      let rewritten = message.content;
-      for (const { rule, matches } of matchesByRule) {
-        if (rule.name === 'twitter' || !matches.length) continue;
-        rewritten = rewritten.replace(rule.regex, rule.convert);
+      if (hasTweet && !cardResult.ok) {
+        await sendViaWebhook(webhookChannel, { ...buildFallbackPayload(rewritten, tweetInfos), ...identity });
+      } else {
+        await sendViaWebhook(webhookChannel, { ...buildPrimaryPayload(prepared), ...identity });
       }
-
-      const identity = {
-        username: message.member?.displayName ?? message.author.username,
-        avatarURL: message.author.displayAvatarURL(),
-        threadId,
-        allowedMentions: { parse: [] },
-      };
-
-      // Messages with no tweet at all (just Instagram/TikTok/Bluesky) skip the whole
-      // card/fallback system and keep the original simple plain-content behavior — those
-      // platforms already work fine via native unfurl and aren't part of this feature, and
-      // Components-v2 text isn't confirmed to auto-unfurl links the way normal content does.
-      const hasTweet = twitterMatches.length > 0;
-
-      const sizeCap = getAttachmentSizeCap(message.guild);
-      const cardResult = hasTweet ? await buildTweetCards(tweetInfos, sizeCap) : null;
-
-      // Send the replacement first and only delete the original once it's confirmed posted —
-      // otherwise a failed send would silently wipe the user's message with nothing to show
-      // for it.
-      try {
-        if (!hasTweet) {
-          await sendViaWebhook(webhookChannel, { content: rewritten, ...identity });
-        } else if (cardResult.ok) {
-          const extraLinks = buildExtraLinksContainer(matchesByRule);
-          await sendViaWebhook(webhookChannel, {
-            flags: MessageFlags.IsComponentsV2,
-            components: extraLinks ? [...cardResult.containers, extraLinks] : cardResult.containers,
-            files: cardResult.files,
-            ...identity,
-          });
-        } else {
+    } catch (sendError) {
+      // If the custom-card send failed unexpectedly (e.g. our size estimate was wrong and
+      // Discord rejected the upload), retry once with the plain-link fallback before giving
+      // up — this is the safety net for cases buildTweetCards' proactive check didn't catch.
+      // (No retry is attempted for the other paths — there's nothing further to fall back to.)
+      if (hasTweet && cardResult.ok) {
+        try {
+          console.error('Custom card send failed, retrying with plain-link fallback:', sendError);
           await sendViaWebhook(webhookChannel, { ...buildFallbackPayload(rewritten, tweetInfos), ...identity });
-        }
-      } catch (sendError) {
-        // If the custom-card send failed unexpectedly (e.g. our size estimate was wrong and
-        // Discord rejected the upload), retry once with the plain-link fallback before giving
-        // up — this is the safety net for cases buildTweetCards' proactive check didn't catch.
-        // (No retry is attempted for the other paths — there's nothing further to fall back to.)
-        if (hasTweet && cardResult.ok) {
-          try {
-            console.error('Custom card send failed, retrying with plain-link fallback:', sendError);
-            await sendViaWebhook(webhookChannel, { ...buildFallbackPayload(rewritten, tweetInfos), ...identity });
-          } catch (fallbackError) {
-            console.error('Fallback send also failed, leaving original in place:', fallbackError);
-            await message.react('⚠️').catch(() => {});
-            return;
-          }
-        } else {
-          console.error('Failed to post replacement message, leaving original in place:', sendError);
+        } catch (fallbackError) {
+          console.error('Fallback send also failed, leaving original in place:', fallbackError);
           await message.react('⚠️').catch(() => {});
           return;
         }
+      } else {
+        console.error('Failed to post replacement message, leaving original in place:', sendError);
+        await message.react('⚠️').catch(() => {});
+        return;
       }
-
-      await message.delete().catch((deleteError) => {
-        console.error('Replacement posted but failed to delete the original message:', deleteError);
-      });
-    } catch (error) {
-      console.error('Error processing message:', error);
-      await message.react('⚠️').catch(() => {});
     }
+
+    await message.delete().catch((deleteError) => {
+      console.error('Replacement posted but failed to delete the original message:', deleteError);
+    });
+  } catch (error) {
+    console.error('Error processing message:', error);
+    await message.react('⚠️').catch(() => {});
+  }
+});
+
+// /fix <link>: manually triggers the same fixing/translation/video pipeline on a pasted link.
+// Registered for both guild and user installs, and usable in guilds, bot DMs, and group DMs —
+// unlike the passive auto-detect above, an interaction carries its own data directly, so it
+// works anywhere without needing the Message Content intent at all. This is the only way to
+// get this bot's functionality in a DM or in a server it hasn't been added to as a member.
+const fixCommand = new SlashCommandBuilder()
+  .setName('fix')
+  .setDescription('Fix a Twitter/X, Instagram, TikTok, or Bluesky link')
+  .addStringOption((option) =>
+    option.setName('link').setDescription('The link to fix').setRequired(true)
+  )
+  .setIntegrationTypes(ApplicationIntegrationType.GuildInstall, ApplicationIntegrationType.UserInstall)
+  .setContexts(InteractionContextType.Guild, InteractionContextType.BotDM, InteractionContextType.PrivateChannel);
+
+client.on('ready', async () => {
+  console.log(`✅ Bot logged in as ${client.user.tag}`);
+  client.user.setActivity('for social media links', { type: 'WATCHING' });
+
+  try {
+    await client.application.commands.set([fixCommand]);
+  } catch (error) {
+    console.error('Failed to register slash commands:', error);
+  }
+});
+
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== 'fix') return;
+
+  const link = interaction.options.getString('link', true);
+
+  const prepared = await prepareLinkResponse(link, interaction.guild);
+  if (!prepared) {
+    await interaction.reply({
+      content: "That doesn't look like a supported link (Twitter/X, Instagram, TikTok, or Bluesky).",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const { rewritten, hasTweet, tweetInfos, cardResult } = prepared;
+  await interaction.deferReply();
+
+  try {
+    if (hasTweet && !cardResult.ok) {
+      await interaction.editReply(buildFallbackPayload(rewritten, tweetInfos));
+      return;
+    }
+
+    try {
+      await interaction.editReply(buildPrimaryPayload(prepared));
+    } catch (sendError) {
+      if (hasTweet && cardResult.ok) {
+        console.error('Custom card reply failed, retrying with plain-link fallback:', sendError);
+        await interaction.editReply(buildFallbackPayload(rewritten, tweetInfos));
+      } else {
+        throw sendError;
+      }
+    }
+  } catch (error) {
+    console.error('Error handling /fix command:', error);
+    await interaction.editReply("Something went wrong fixing that link.").catch(() => {});
   }
 });
 
