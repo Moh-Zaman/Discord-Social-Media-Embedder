@@ -31,20 +31,23 @@
 <body>
 
 <h1>Privacy Policy</h1>
-<p class="updated">Last updated: September 13, 2026</p>
+<p class="updated">Last updated: September 14, 2026</p>
 
 <div class="tldr">
 <strong>Short version:</strong> inviting the bot to your server is the only thing you ever need to do. There's no account, no sign-up, no dashboard to log into. The bot doesn't store your messages, your username, or anything else, it reads a message, acts on it, and forgets it happened.
 </div>
 
 <h2>What the bot sees</h2>
-<p>To do its job, the bot has to read message content as it comes in, so it can check for Twitter/X and Instagram links. That check happens instantly in memory. Nothing is written to a database, a log file, or anywhere else. If a message doesn't contain one of those links, the bot doesn't do anything with it at all, it's not being recorded or analyzed in the background.</p>
+<p>To do its job, the bot has to read message content as it comes in, so it can check for Twitter/X, Instagram, TikTok, and Bluesky links. That check happens instantly in memory. Nothing is written to a database, a log file, or anywhere else. If a message doesn't contain one of those links, the bot doesn't do anything with it at all, it's not being recorded or analyzed in the background.</p>
 
 <h2>What happens when it finds a link</h2>
-<p>The bot deletes your original message and reposts the fixed-up link. To make that repost look like it came from you, it grabs your current Discord display name and avatar at that moment and uses them for the repost, it doesn't save a copy of either one anywhere. Next time you post, it just grabs them fresh again.</p>
+<p>The bot deletes your original message and reposts the fixed-up version. To make that repost look like it came from you, it grabs your current Discord display name and avatar at that moment and uses them for the repost, it doesn't save a copy of either one anywhere. Next time you post, it just grabs them fresh again.</p>
+
+<h2>Tweet videos</h2>
+<p>For a tweet with video, the bot downloads the video and re-uploads it to Discord directly so it plays natively in your server, rather than only linking out to it. That video passes through the bot's memory just long enough to hand it to Discord; it's never written to disk or kept around afterward. If a video is too large to attach, the bot falls back to posting a plain link instead so Discord can still generate its own preview.</p>
 
 <h2>Third-party services</h2>
-<p>The whole point of the bot is rewriting links to use <code>fixupx.com</code> (for Twitter/X) and <code>kkinstagram.com</code> (for Instagram) so Discord can generate a proper preview. Once that link is posted, Discord's own servers fetch the preview directly from those sites, the bot itself doesn't send them any of your data. Those are independent services I don't run or control, so it's worth knowing they exist, but I have no visibility into anything they do on their end.</p>
+<p>To build each tweet's card (text, translation, author, media), the bot queries <code>api.fxtwitter.com</code>. For Instagram, TikTok, and Bluesky, links are rewritten to use <code>kkinstagram.com</code>, <code>tnktok.com</code>, and <code>fxbsky.app</code>, so Discord can generate a proper preview directly from those sites once the link is posted. These are independent services I don't run or control, so it's worth knowing they exist, but I have no visibility into anything they do on their end.</p>
 
 <h2>What's never collected</h2>
 <p>No emails, no IP addresses, no server member lists, no analytics, no tracking. The bot doesn't ask for anything beyond what it needs at the moment a link shows up, and it doesn't hang on to any of it afterward.</p>

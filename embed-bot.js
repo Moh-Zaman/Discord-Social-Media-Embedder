@@ -45,7 +45,7 @@ const LINK_RULES = [
   {
     name: 'tiktok',
     regex: /(https?:\/\/)?(www\.)?tiktok\.com\/(\S+)/gi,
-    convert: (url) => url.replace(/https?:\/\/(www\.)?tiktok\.com/, 'https://tnktok.com'),
+    convert: (url) => url.replace(/https?:\/\/(www\.)?tiktok\.com/, 'https://vt.tnktok.com'),
   },
   {
     name: 'bluesky',
@@ -81,6 +81,9 @@ const EMPTY_TWEET_INFO = {
   stats: { likes: 0, retweets: 0, replies: 0 },
   tweetUrl: null,
   quote: null,
+  createdTimestamp: null,
+  sensitive: false,
+  communityNote: null,
 };
 
 // Pulls tweet info via the fxtwitter API (fixupx.com's backend): the tweet text, an English
@@ -112,7 +115,12 @@ async function getTweetInfo(url) {
       video: video ? { duration: video.duration ?? null, variants: mp4Variants, bestUrl: video.url } : null,
       photos: tweet.media?.photos?.map((p) => p.url) ?? [],
       author: tweet.author
-        ? { name: tweet.author.name, screenName: tweet.author.screen_name, avatarUrl: tweet.author.avatar_url }
+        ? {
+            name: tweet.author.name,
+            screenName: tweet.author.screen_name,
+            avatarUrl: tweet.author.avatar_url,
+            verified: tweet.author.verification?.verified ?? false,
+          }
         : null,
       stats: { likes: tweet.likes ?? 0, retweets: tweet.retweets ?? 0, replies: tweet.replies ?? 0 },
       tweetUrl: tweet.url ?? null,
@@ -125,6 +133,11 @@ async function getTweetInfo(url) {
                 : null,
             }
           : null,
+      createdTimestamp: tweet.created_timestamp ?? null,
+      // possibly_sensitive is what the API calls it; not currently confirmed to ever be
+      // populated with real community-note content (see comment on buildTweetContainer).
+      sensitive: tweet.possibly_sensitive ?? false,
+      communityNote: tweet.community_note?.text ?? null,
     };
   } catch {
     return EMPTY_TWEET_INFO;
@@ -221,7 +234,8 @@ function buildTweetContainer(info, videoAttachment) {
 
   if (info.author) {
     const profileUrl = `https://x.com/${info.author.screenName}`;
-    const authorLine = `[**${info.author.name}** (@${info.author.screenName})](${profileUrl})`;
+    const verifiedBadge = info.author.verified ? ' ✅' : '';
+    const authorLine = `[**${info.author.name}**${verifiedBadge} (@${info.author.screenName})](${profileUrl})`;
     container.addTextDisplayComponents(new TextDisplayBuilder().setContent(authorLine));
   }
 
@@ -235,6 +249,16 @@ function buildTweetContainer(info, videoAttachment) {
     );
   }
 
+  // communityNote is wired up defensively: as of writing, the fxtwitter API doesn't appear to
+  // ever actually populate this field (see FxEmbed issue #776), so this is future-proofing more
+  // than a working feature today — it'll start showing up automatically if that ever changes.
+  if (info.communityNote) {
+    container.addSeparatorComponents(new SeparatorBuilder());
+    container.addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(`📝 **Community Note:** ${info.communityNote}`)
+    );
+  }
+
   if (info.quote) {
     container.addSeparatorComponents(new SeparatorBuilder());
     const quoteHeader = info.quote.author
@@ -243,23 +267,28 @@ function buildTweetContainer(info, videoAttachment) {
     container.addTextDisplayComponents(new TextDisplayBuilder().setContent(`${quoteHeader}\n${info.quote.text}`));
   }
 
+  // Sensitive media is spoiler-tagged (blurred, click-to-reveal) rather than shown openly,
+  // matching how X itself gates flagged content instead of just displaying it.
   if (videoAttachment) {
     container.addMediaGalleryComponents(
-      new MediaGalleryBuilder().addItems(new MediaGalleryItemBuilder().setURL(`attachment://${videoAttachment.name}`))
+      new MediaGalleryBuilder().addItems(
+        new MediaGalleryItemBuilder().setURL(`attachment://${videoAttachment.name}`).setSpoiler(info.sensitive)
+      )
     );
   } else if (info.photos.length) {
     const gallery = new MediaGalleryBuilder();
     for (const photoUrl of info.photos.slice(0, 4)) {
-      gallery.addItems(new MediaGalleryItemBuilder().setURL(photoUrl));
+      gallery.addItems(new MediaGalleryItemBuilder().setURL(photoUrl).setSpoiler(info.sensitive));
     }
     container.addMediaGalleryComponents(gallery);
   }
 
   if (isEnriched) {
     container.addSeparatorComponents(new SeparatorBuilder());
+    const timestamp = info.createdTimestamp ? `<t:${info.createdTimestamp}:R> · ` : '';
     container.addTextDisplayComponents(
       new TextDisplayBuilder().setContent(
-        `-# 💬 ${formatCompact(info.stats.replies)}  🔁 ${formatCompact(info.stats.retweets)}  ❤️ ${formatCompact(info.stats.likes)}`
+        `-# ${timestamp}💬 ${formatCompact(info.stats.replies)}  🔁 ${formatCompact(info.stats.retweets)}  ❤️ ${formatCompact(info.stats.likes)}`
       )
     );
   }
@@ -346,20 +375,26 @@ function formatTranslationBlock(translation) {
   );
 }
 
-function buildTranslationEmbeds({ translation, author, photos, stats, tweetUrl }) {
+function buildTranslationEmbeds({ translation, author, photos, stats, tweetUrl, createdTimestamp, communityNote }) {
+  let description = translation.text;
+  if (communityNote) description += `\n\n📝 **Community Note:** ${communityNote}`;
+
   const main = new EmbedBuilder()
     .setColor(0x1d9bf0)
-    .setDescription(translation.text)
+    .setDescription(description)
     .setFooter({ text: `🌐 Translated from ${translation.sourceLang} · 💬 ${stats.replies}  🔁 ${stats.retweets}  ❤️ ${stats.likes}` });
 
   if (tweetUrl) main.setURL(tweetUrl);
+  if (createdTimestamp) main.setTimestamp(createdTimestamp * 1000);
   if (author) {
     main.setAuthor({
-      name: `${author.name} (@${author.screenName})`,
+      name: `${author.name}${author.verified ? ' ✅' : ''} (@${author.screenName})`,
       iconURL: author.avatarUrl ?? undefined,
       url: author.screenName ? `https://x.com/${author.screenName}` : undefined,
     });
   }
+  // Legacy Embeds don't support spoiler-tagging images, unlike the Components-v2 card, so
+  // sensitive photos here are shown openly — a known, accepted gap for this rare fallback path.
   if (photos[0]) main.setImage(photos[0]);
 
   const galleryEmbeds = photos.slice(1, 4).map((photoUrl) => new EmbedBuilder().setURL(tweetUrl ?? undefined).setImage(photoUrl));
