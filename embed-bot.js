@@ -133,8 +133,15 @@ async function getTweetInfo(url) {
 
     return {
       text: tweet.text ?? '',
+      // Deriving the language name ourselves (getLanguageName, below) rather than trusting the
+      // API's own source_lang_en is deliberate: confirmed live that it can come back malformed
+      // for less-common languages (e.g. "language_cy" instead of "Welsh" for raw code "cy"),
+      // whereas our own Intl-based lookup resolves the same raw code correctly every time.
       translation: tweet.translation
-        ? { text: tweet.translation.text, sourceLang: tweet.translation.source_lang_en }
+        ? {
+            text: tweet.translation.text,
+            sourceLang: getLanguageName(tweet.translation.source_lang) ?? tweet.translation.source_lang_en ?? null,
+          }
         : null,
       video: parseVideo(tweet.media?.videos?.[0]),
       photos: tweet.media?.photos?.map((p) => p.url) ?? [],
@@ -158,15 +165,14 @@ async function getTweetInfo(url) {
       quote: tweet.quote
         ? {
             text: tweet.quote.text ?? '',
-            // The quote's translation object doesn't reliably carry source_lang_en the way the
-            // outer tweet's does (confirmed live: it came back undefined) — fall back to the
-            // raw source_lang code, and to null (rendered as just "Translated", no "from X") if
-            // even that's missing, rather than ever showing a literal "undefined".
+            // Same getLanguageName-first priority as the outer tweet's translation above — the
+            // API's source_lang_en has now been seen both missing (quotes) and malformed
+            // (outer), so it's only used as a last resort, never trusted first.
             translation: tweet.quote.translation
               ? {
                   text: tweet.quote.translation.text,
                   sourceLang:
-                    tweet.quote.translation.source_lang_en ?? getLanguageName(tweet.quote.translation.source_lang),
+                    getLanguageName(tweet.quote.translation.source_lang) ?? tweet.quote.translation.source_lang_en ?? null,
                 }
               : null,
             author: tweet.quote.author
@@ -265,15 +271,24 @@ function formatCompact(n) {
 
 // --- Custom Components v2 card (replaces the fixupx.com native embed) ---
 
-// One Container per tweet: author (name/avatar), body text (translated text takes priority
-// over the original), quoted-tweet text and media if this is a quote-tweet, the tweet's own
-// media (a native video attachment or its photos), stats, and action buttons. `videoAttachment`
-// and `quoteVideoAttachment` are passed in separately (rather than looked up from `info`)
-// because they're already been downloaded by the time this runs, and referencing an attachment
-// by filename is how Components v2 embeds an uploaded file into a MediaGallery.
+// One Container per tweet, in order: author (name/avatar), body text (translated text takes
+// priority over the original), the tweet's own media (a native video attachment or its photos),
+// then a separated section below for quoted-tweet text and media if this is a quote-tweet, then
+// stats and action buttons. Own media comes before the quote section so it's clear at a glance
+// which media belongs to the tweet itself versus what it's quoting. `videoAttachment` and
+// `quoteVideoAttachment` are passed in separately (rather than looked up from `info`) because
+// they've already been downloaded by the time this runs, and referencing an attachment by
+// filename is how Components v2 embeds an uploaded file into a MediaGallery.
 function buildTweetContainer(info, videoAttachment, quoteVideoAttachment) {
   const container = new ContainerBuilder().setAccentColor(0x1d9bf0);
   const isEnriched = Boolean(info.author);
+
+  // A small platform label above the author line, similar to how X's own UI shows the source
+  // above the account. Components v2 has no way to place a real logo image tucked next to small
+  // text (a Section's thumbnail accessory only docks to the right, at a larger fixed size — see
+  // the author-avatar comment history for why that was ruled out), so this uses the 𝕏 glyph as
+  // a lightweight text-based stand-in instead of an actual image asset.
+  container.addTextDisplayComponents(new TextDisplayBuilder().setContent('-# 𝕏 Twitter/X'));
 
   if (info.author) {
     const profileUrl = `https://x.com/${info.author.screenName}`;
@@ -302,6 +317,24 @@ function buildTweetContainer(info, videoAttachment, quoteVideoAttachment) {
     );
   }
 
+  // The tweet's own media comes before the quote section (rather than after), so it's clear at
+  // a glance which media belongs to the tweet itself versus the tweet it's quoting. Sensitive
+  // media is spoiler-tagged (blurred, click-to-reveal) rather than shown openly, matching how X
+  // itself gates flagged content instead of just displaying it.
+  if (videoAttachment) {
+    container.addMediaGalleryComponents(
+      new MediaGalleryBuilder().addItems(
+        new MediaGalleryItemBuilder().setURL(`attachment://${videoAttachment.name}`).setSpoiler(info.sensitive)
+      )
+    );
+  } else if (info.photos.length) {
+    const gallery = new MediaGalleryBuilder();
+    for (const photoUrl of info.photos.slice(0, 4)) {
+      gallery.addItems(new MediaGalleryItemBuilder().setURL(photoUrl).setSpoiler(info.sensitive));
+    }
+    container.addMediaGalleryComponents(gallery);
+  }
+
   if (info.quote) {
     container.addSeparatorComponents(new SeparatorBuilder());
     const quoteHeader = info.quote.author
@@ -320,9 +353,9 @@ function buildTweetContainer(info, videoAttachment, quoteVideoAttachment) {
       container.addTextDisplayComponents(new TextDisplayBuilder().setContent(quoteTranslationNote));
     }
 
-    // Quoted media is spoiler-tagged the same as the tweet's own media (see below) — we don't
-    // get a separate sensitivity flag for the quoted tweet from the API, so this reuses the
-    // outer tweet's flag as the closest available signal.
+    // Quoted media is spoiler-tagged the same as the tweet's own media above — we don't get a
+    // separate sensitivity flag for the quoted tweet from the API, so this reuses the outer
+    // tweet's flag as the closest available signal.
     if (quoteVideoAttachment) {
       container.addMediaGalleryComponents(
         new MediaGalleryBuilder().addItems(
@@ -336,22 +369,6 @@ function buildTweetContainer(info, videoAttachment, quoteVideoAttachment) {
       }
       container.addMediaGalleryComponents(quoteGallery);
     }
-  }
-
-  // Sensitive media is spoiler-tagged (blurred, click-to-reveal) rather than shown openly,
-  // matching how X itself gates flagged content instead of just displaying it.
-  if (videoAttachment) {
-    container.addMediaGalleryComponents(
-      new MediaGalleryBuilder().addItems(
-        new MediaGalleryItemBuilder().setURL(`attachment://${videoAttachment.name}`).setSpoiler(info.sensitive)
-      )
-    );
-  } else if (info.photos.length) {
-    const gallery = new MediaGalleryBuilder();
-    for (const photoUrl of info.photos.slice(0, 4)) {
-      gallery.addItems(new MediaGalleryItemBuilder().setURL(photoUrl).setSpoiler(info.sensitive));
-    }
-    container.addMediaGalleryComponents(gallery);
   }
 
   if (isEnriched) {
