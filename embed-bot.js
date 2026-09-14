@@ -13,6 +13,7 @@ const {
   MediaGalleryItemBuilder,
   AttachmentBuilder,
   MessageFlags,
+  RESTJSONErrorCodes,
 } = require('discord.js');
 require('dotenv').config();
 
@@ -430,6 +431,25 @@ async function getWebhook(channel) {
   return webhook;
 }
 
+// Sends through the channel's cached webhook, and self-heals if that webhook has gone stale
+// (e.g. the bot was kicked and re-invited, or someone deleted the webhook manually) — Discord
+// then rejects the send with "Unknown Webhook" (10015). Dropping the cache entry and fetching
+// a fresh webhook recovers automatically instead of every message failing until a manual
+// restart clears the in-memory cache.
+async function sendViaWebhook(channel, payload) {
+  const webhook = await getWebhook(channel);
+  try {
+    return await webhook.send(payload);
+  } catch (error) {
+    if (error.code !== RESTJSONErrorCodes.UnknownWebhook) throw error;
+
+    console.error('Cached webhook is stale, refreshing and retrying once:', error);
+    webhookCache.delete(channel.id);
+    const freshWebhook = await getWebhook(channel);
+    return freshWebhook.send(payload);
+  }
+}
+
 client.on('messageCreate', async (message) => {
   // Ignore bot messages and DMs
   if (message.author.bot) return;
@@ -444,7 +464,6 @@ client.on('messageCreate', async (message) => {
     try {
       const isThread = message.channel.isThread();
       const webhookChannel = isThread ? message.channel.parent : message.channel;
-      const webhook = await getWebhook(webhookChannel);
       const threadId = isThread ? message.channel.id : undefined;
 
       // Non-Twitter links just get their plain domain swap; Twitter links go through the
@@ -476,17 +495,17 @@ client.on('messageCreate', async (message) => {
       // for it.
       try {
         if (!hasTweet) {
-          await webhook.send({ content: rewritten, ...identity });
+          await sendViaWebhook(webhookChannel, { content: rewritten, ...identity });
         } else if (cardResult.ok) {
           const extraLinks = buildExtraLinksContainer(matchesByRule);
-          await webhook.send({
+          await sendViaWebhook(webhookChannel, {
             flags: MessageFlags.IsComponentsV2,
             components: extraLinks ? [...cardResult.containers, extraLinks] : cardResult.containers,
             files: cardResult.files,
             ...identity,
           });
         } else {
-          await webhook.send({ ...buildFallbackPayload(rewritten, tweetInfos), ...identity });
+          await sendViaWebhook(webhookChannel, { ...buildFallbackPayload(rewritten, tweetInfos), ...identity });
         }
       } catch (sendError) {
         // If the custom-card send failed unexpectedly (e.g. our size estimate was wrong and
@@ -496,7 +515,7 @@ client.on('messageCreate', async (message) => {
         if (hasTweet && cardResult.ok) {
           try {
             console.error('Custom card send failed, retrying with plain-link fallback:', sendError);
-            await webhook.send({ ...buildFallbackPayload(rewritten, tweetInfos), ...identity });
+            await sendViaWebhook(webhookChannel, { ...buildFallbackPayload(rewritten, tweetInfos), ...identity });
           } catch (fallbackError) {
             console.error('Fallback send also failed, leaving original in place:', fallbackError);
             await message.react('⚠️').catch(() => {});
