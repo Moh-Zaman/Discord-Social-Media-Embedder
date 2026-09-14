@@ -48,6 +48,11 @@ const LINK_RULES = [
     convert: (url) => url.replace(/https?:\/\/(www\.)?tiktok\.com/, 'https://vt.tnktok.com'),
   },
   {
+    name: 'tiktok-mobile',
+    regex: /(https?:\/\/)?(www\.)?vt.tiktok\.com\/(\S+)/gi,
+    convert: (url) => url.replace(/https?:\/\/(www\.)?vt.tiktok\.com/, 'https://vt.tnktok.com'),
+  },
+  {
     name: 'bluesky',
     regex: /(https?:\/\/)?(www\.)?bsky\.app\/(\S+)/gi,
     convert: (url) => url.replace(/https?:\/\/(www\.)?bsky\.app/, 'https://fxbsky.app'),
