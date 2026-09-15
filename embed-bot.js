@@ -882,8 +882,26 @@ client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
   if (message.channel.type === ChannelType.DM) return;
 
+  // Cheap, synchronous pre-check so we know whether to bother at all before doing anything
+  // async. findLinks runs again inside prepareLinkResponse right after — it's pure regex
+  // matching, negligible cost, not worth restructuring around.
+  if (!findLinks(message.content).modified) return;
+
+  // A reaction-based "processing" indicator, not Discord's typing indicator: our reply always
+  // goes out through a webhook, not the bot's own user account, so Discord's "stop typing once
+  // this user sends a message" auto-clear never fires for it — confirmed live, it just sat there
+  // until the ~10s timeout regardless of how fast we actually replied. A reaction we add and
+  // remove ourselves is fully within our own control: it disappears immediately when the
+  // original message is deleted on success, and is explicitly removed on every failure path
+  // below so it never lingers claiming we're still working when we're not.
+  const workingReaction = await message.react('⏳').catch(() => null);
+  const clearWorkingReaction = () => workingReaction?.users.remove(client.user.id).catch(() => {});
+
   const prepared = await prepareLinkResponse(message.content, message.guild);
-  if (!prepared) return;
+  if (!prepared) {
+    await clearWorkingReaction();
+    return;
+  }
   const { hasTweet, cardResult } = prepared;
 
   try {
@@ -918,11 +936,13 @@ client.on('messageCreate', async (message) => {
           await sendViaWebhook(webhookChannel, { ...buildFallbackPayloadForPrepared(prepared), ...identity });
         } catch (fallbackError) {
           console.error('Fallback send also failed, leaving original in place:', fallbackError);
+          await clearWorkingReaction();
           await message.react('⚠️').catch(() => {});
           return;
         }
       } else {
         console.error('Failed to post replacement message, leaving original in place:', sendError);
+        await clearWorkingReaction();
         await message.react('⚠️').catch(() => {});
         return;
       }
@@ -930,9 +950,13 @@ client.on('messageCreate', async (message) => {
 
     await message.delete().catch((deleteError) => {
       console.error('Replacement posted but failed to delete the original message:', deleteError);
+      // The reply went out fine, just the cleanup step failed — clear the now-misleading
+      // "still processing" reaction, but no ⚠️ needed since the actual content did post.
+      clearWorkingReaction();
     });
   } catch (error) {
     console.error('Error processing message:', error);
+    await clearWorkingReaction();
     await message.react('⚠️').catch(() => {});
   }
 });
