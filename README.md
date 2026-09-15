@@ -1,13 +1,14 @@
 # Embed Bot 🔗
 
-A Discord.js bot that turns Twitter/X, Instagram, TikTok, and Bluesky links into real, working previews, automatically. Tweets get the full treatment: translated to English when needed, native video playback, and a custom card with the author, verified badge, post timestamp, quoted tweet, and sensitive-content warnings, all built without leaving Discord.
+A Discord.js bot that turns Twitter/X, Instagram, TikTok, Bluesky, and Steam store links into real, working previews, automatically. Tweets get the full treatment: translated to English when needed, native video playback, and a custom card with the author, verified badge, post timestamp, quoted tweet, and sensitive-content warnings, all built without leaving Discord.
 
 ## How It Works
 
 When someone posts a link to:
 
 - **Twitter/X**: the bot fetches the tweet's data, builds a rich card, and posts it directly. If the tweet has video, the video itself is downloaded and re-uploaded as a native Discord attachment, so it plays inline with no dependency on any third-party embed page.
-- **Instagram**: `https://instagram.com/p/ABC123/` becomes `https://kkinstagram.com/p/ABC123/`
+- **Instagram**: the bot scrapes the post's caption, author, and (if present) video via a third-party fixer and builds a card directly; photos aren't supported yet (see Notes).
+- **Steam**: the bot fetches the store listing via Steam's own public API and builds a card with the title, description, developers/publisher, price, and header image.
 - **TikTok**: `https://tiktok.com/@user/video/123` becomes `https://tnktok.com/@user/video/123`
 - **Bluesky**: `https://bsky.app/profile/user/post/abc` becomes `https://fxbsky.app/profile/user/post/abc`
 
@@ -20,6 +21,8 @@ Twitter/X links get extra handling beyond a simple domain swap:
 - **A custom card**, including the tweet author (with a verified badge if applicable), the post's relative timestamp, quoted-tweet context for quote tweets, reply/retweet/like counts, and a spoiler tag over sensitive media instead of showing it openly.
 - **Multiple tweets in one message** are each handled individually, up to a few per message.
 - A **download button** for the original video, and a **view original** button linking back to the tweet.
+
+Steam links don't get video: trailers are only served as fragmented DASH/HLS streams (not a single downloadable file), so a static header image is used instead. The card also can't include a button that opens the game directly in the Steam app — Discord's Link buttons only accept `http(s)` URLs — so the `steam://` deep link is shown as plain text instead, alongside a normal "View on Steam" button that opens the store page in a browser.
 
 Reddit and Threads links aren't handled. Their known embed fixers are currently broken, so they're left as-is rather than pointing at something unreliable.
 
@@ -77,7 +80,7 @@ npm run dev
 
 ## Features
 
-- ✅ Automatically detects Twitter/X, Instagram, TikTok, and Bluesky links
+- ✅ Automatically detects Twitter/X, Instagram, TikTok, Bluesky, and Steam store links
 - ✅ Translates non-English tweets, showing both the translation and the source language
 - ✅ Downloads and re-uploads tweet videos as native Discord attachments for playback with no external dependency
 - ✅ Falls back to a plain link automatically if a video is too large to attach, so playback is never lost
@@ -91,7 +94,8 @@ npm run dev
 ## Services Used
 
 - **Twitter/X data and translation**: [api.fxtwitter.com](https://api.fxtwitter.com)
-- **Instagram**: [kkinstagram.com](https://kkinstagram.com)
+- **Instagram**: [instagram7.com](https://instagram7.com)
+- **Steam**: [Steam's official public store API](https://store.steampowered.com)
 - **TikTok**: [tnktok.com](https://tnktok.com)
 - **Bluesky**: [fxbsky.app](https://fxbsky.app)
 

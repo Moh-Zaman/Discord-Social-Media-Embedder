@@ -76,15 +76,24 @@ const LINK_RULES = [
     regex: /(?<![a-zA-Z0-9])(https?:\/\/)?(www\.)?bsky\.app\/(\S+)/gi,
     convert: (url) => url.replace(/https?:\/\/(www\.)?bsky\.app/, 'https://fxbsky.app'),
   },
+  {
+    name: 'steam',
+    // Unlike the others, there's no third-party fixer domain to swap to here — Steam store
+    // pages already unfurl decently on their own (Discord reads their og:title/description/
+    // image directly), so this rule exists purely for detection, and `convert` is a no-op used
+    // only when the rich card (see buildSteamCards) can't be built for some reason.
+    regex: /(?<![a-zA-Z0-9])(https?:\/\/)?(www\.)?store\.steampowered\.com\/app\/(\d+)(\/\S*)?/gi,
+    convert: (url) => url,
+  },
 ];
 
 const TWITTER_RULE = LINK_RULES.find((rule) => rule.name === 'twitter');
 const INSTAGRAM_RULE = LINK_RULES.find((rule) => rule.name === 'instagram');
 
-// Finds every social link in a message. Twitter/X and Instagram matches are also returned
-// separately (still in their original, unconverted form) since those need async per-post
-// handling (translation/video/rich cards for tweets, scraped caption/media for Instagram)
-// before the final message can be built.
+// Finds every social link in a message. Twitter/X, Instagram, and Steam matches are also
+// returned separately (still in their original, unconverted form) since those need async
+// per-link handling (translation/video/rich cards for tweets, scraped caption/media for
+// Instagram, store data for Steam) before the final message can be built.
 function findLinks(content) {
   const matchesByRule = LINK_RULES.map((rule) => ({
     rule,
@@ -95,6 +104,7 @@ function findLinks(content) {
     matchesByRule,
     twitterMatches: matchesByRule.find((m) => m.rule.name === 'twitter').matches,
     instagramMatches: matchesByRule.find((m) => m.rule.name === 'instagram').matches,
+    steamMatches: matchesByRule.find((m) => m.rule.name === 'steam').matches,
     modified: matchesByRule.some((m) => m.matches.length > 0),
   };
 }
@@ -483,7 +493,7 @@ async function buildTweetCards(tweetInfos, sizeCap) {
 // small container instead. `extraPlainLinks` are already-converted strings, not raw matches.
 function buildExtraLinksContainer(matchesByRule, extraPlainLinks = []) {
   const links = matchesByRule
-    .filter(({ rule }) => rule.name !== 'twitter' && rule.name !== 'instagram')
+    .filter(({ rule }) => rule.name !== 'twitter' && rule.name !== 'instagram' && rule.name !== 'steam')
     .flatMap(({ rule, matches }) => matches.map((raw) => rule.convert(raw)));
 
   const allLinks = [...links, ...extraPlainLinks];
@@ -658,6 +668,278 @@ async function buildInstagramCards(instagramMatches, sizeCap) {
   return { containers, files, plainLinks };
 }
 
+// --- Steam store card ---
+//
+// Unlike Instagram, this has a clean official JSON API (no scraping): appdetails is public,
+// undocumented-but-stable, and used by Steam's own storefront. Confirmed live it returns name,
+// short_description, developers/publishers, header_image, and price_overview cleanly for a
+// normal store page.
+//
+// An "open in Steam app" button isn't possible: Discord Link buttons only accept http(s) URLs —
+// confirmed live that ButtonBuilder.setURL() throws "Invalid URL protocol" for a steam:// URI.
+// The documented steam://openurl/<store-url> deep link is included as plain text instead, since
+// Components v2 text still renders/links it on clients that recognize the custom protocol
+// (Steam desktop); it just can't be a clickable button, and won't do anything on mobile/web.
+
+async function getSteamInfo(url) {
+  const idMatch = url.match(/\/app\/(\d+)/);
+  if (!idMatch) return null;
+  const appId = idMatch[1];
+
+  try {
+    const res = await fetch(`https://store.steampowered.com/api/appdetails?appids=${appId}&cc=us&l=en`);
+    if (!res.ok) return null;
+
+    const data = await res.json();
+    const entry = data?.[appId];
+    if (!entry?.success || !entry.data) return null;
+
+    const game = entry.data;
+    const price = game.is_free
+      ? 'Free to Play'
+      : game.price_overview
+        ? game.price_overview.discount_percent > 0
+          ? `~~${game.price_overview.initial_formatted}~~ **${game.price_overview.final_formatted}** (-${game.price_overview.discount_percent}%)`
+          : game.price_overview.final_formatted
+        : null;
+
+    const storeUrl = `https://store.steampowered.com/app/${appId}/`;
+    return {
+      name: game.name ?? 'Unknown Game',
+      description: game.short_description || null,
+      developers: game.developers?.join(', ') ?? null,
+      publishers: game.publishers?.join(', ') ?? null,
+      headerImage: game.header_image ?? null,
+      price,
+      storeUrl,
+      steamUri: `steam://openurl/${storeUrl}`,
+      // Only present when Steam lists a trailer at all — the video AdaptationSet's manifest URL,
+      // fetched and parsed separately (see getSteamVideoAttachment) only when a card actually
+      // needs it, since it's a whole extra network round trip.
+      dashManifestUrl: game.movies?.[0]?.dash_h264 ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// --- Steam trailer video, without ffmpeg ---
+//
+// Steam only serves trailers as DASH (no single downloadable mp4/webm — confirmed against
+// several titles, including old ones like Dota 2/CS2/TF2, so this isn't a recent-only change).
+// A DASH video representation's segments (one "init" segment, then a run of numbered "chunk"
+// segments) are themselves already valid fragmented MP4 data — confirmed by downloading real
+// segments and walking their box structure: ftyp+moov (the init segment) followed by repeating
+// styp+sidx+moof+mdat groups (each chunk), which is exactly the standard fMP4 layout used
+// everywhere (DASH, HLS-fMP4, MSE). That means concatenating one representation's segments in
+// order produces one ordinary, playable .mp4 file with no extra tooling at all.
+//
+// What this can't do is add the separate audio representation into that same file — DASH keeps
+// video and audio as two independent single-track streams, and combining two tracks into one
+// container needs a real muxer (ffmpeg). So these videos play back silently. Full audio would
+// mean adding ffmpeg as a new dependency, which hasn't been asked for — the card labels the clip
+// as silent so it's not mistaken for a playback bug.
+
+function parseIsoDuration(iso) {
+  const m = iso?.match(/^PT(?:([\d.]+)H)?(?:([\d.]+)M)?(?:([\d.]+)S)?$/);
+  if (!m || (!m[1] && !m[2] && !m[3])) return null;
+  return Number(m[1] || 0) * 3600 + Number(m[2] || 0) * 60 + Number(m[3] || 0);
+}
+
+function getXmlAttr(tag, name) {
+  return tag.match(new RegExp(`${name}="([^"]*)"`))?.[1] ?? null;
+}
+
+function resolveDashChunkUrl(mediaTemplate, number) {
+  return mediaTemplate.replace(/\$Number(?:%0(\d)d)?\$/, (_, width) =>
+    width ? String(number).padStart(Number(width), '0') : String(number)
+  );
+}
+
+// Parses a Steam DASH manifest down to just the video representations (id, bitrate, resolution,
+// segment template), sorted highest-bitrate-first so the caller can pick the best one that fits
+// a size cap the same way pickVideoVariant does for tweets. Audio is deliberately not parsed —
+// see the comment block above.
+function parseSteamVideoRepresentations(xml) {
+  const totalDuration = parseIsoDuration(xml.match(/mediaPresentationDuration="([^"]+)"/)?.[1]);
+  const videoSet = xml.match(/<AdaptationSet[^>]*contentType="video"[^>]*>([\s\S]*?)<\/AdaptationSet>/)?.[1];
+  if (!totalDuration || !videoSet) return [];
+
+  const representations = [];
+  for (const repMatch of videoSet.matchAll(/<Representation\b[^>]*>[\s\S]*?<\/Representation>/g)) {
+    const repBlock = repMatch[0];
+    const openTag = repBlock.match(/<Representation\b[^>]*>/)[0];
+    const templateTag = repBlock.match(/<SegmentTemplate\b[^>]*>/)?.[0];
+    if (!templateTag) continue;
+
+    const id = getXmlAttr(openTag, 'id');
+    const bandwidth = Number(getXmlAttr(openTag, 'bandwidth'));
+    const timescale = Number(getXmlAttr(templateTag, 'timescale')) || 1;
+    const segDuration = Number(getXmlAttr(templateTag, 'duration')) / timescale;
+    const startNumber = Number(getXmlAttr(templateTag, 'startNumber')) || 1;
+    const initTemplate = getXmlAttr(templateTag, 'initialization');
+    const mediaTemplate = getXmlAttr(templateTag, 'media');
+    if (!id || !bandwidth || !segDuration || !initTemplate || !mediaTemplate) continue;
+
+    representations.push({
+      bandwidth,
+      estimatedBytes: (bandwidth * totalDuration) / 8,
+      init: initTemplate.replace(/\$RepresentationID\$/g, id),
+      mediaTemplate: mediaTemplate.replace(/\$RepresentationID\$/g, id),
+      chunkNumbers: Array.from({ length: Math.ceil(totalDuration / segDuration) }, (_, i) => startNumber + i),
+    });
+  }
+
+  return representations.sort((a, b) => b.bandwidth - a.bandwidth);
+}
+
+// Downloads and concatenates one representation's init + chunk segments into a single mp4
+// attachment, fetching chunks in small parallel batches (segments are independent files, so
+// order of arrival doesn't matter — they're placed back in order afterward). Bails out (returns
+// null) the moment the running total would exceed maxBytes, same safety-net approach as
+// downloadVideoAttachment elsewhere in this file, since the bandwidth-based estimate that picked
+// this representation could still undershoot the real size.
+const DASH_FETCH_CONCURRENCY = 8;
+
+async function downloadSteamVideoAttachment(baseUrl, representation, maxBytes, filename) {
+  try {
+    const initRes = await fetch(baseUrl + representation.init);
+    if (!initRes.ok) return null;
+    const initBuf = Buffer.from(await initRes.arrayBuffer());
+    let total = initBuf.length;
+    if (total > maxBytes) return null;
+
+    const chunkBuffers = new Array(representation.chunkNumbers.length);
+    for (let start = 0; start < representation.chunkNumbers.length; start += DASH_FETCH_CONCURRENCY) {
+      const batch = representation.chunkNumbers.slice(start, start + DASH_FETCH_CONCURRENCY);
+      const results = await Promise.all(
+        batch.map(async (number) => {
+          const res = await fetch(baseUrl + resolveDashChunkUrl(representation.mediaTemplate, number));
+          return res.ok ? Buffer.from(await res.arrayBuffer()) : null;
+        })
+      );
+      for (const [i, buf] of results.entries()) {
+        if (!buf) return null;
+        chunkBuffers[start + i] = buf;
+        total += buf.length;
+      }
+      if (total > maxBytes) return null;
+    }
+
+    return new AttachmentBuilder(Buffer.concat([initBuf, ...chunkBuffers]), { name: filename });
+  } catch {
+    return null;
+  }
+}
+
+// Fetches and parses the DASH manifest, picks the highest-bitrate representation that fits under
+// maxBytes, and downloads it. Returns null (never throws/fails the whole card) on any problem —
+// no manifest, no representation small enough, a mid-download failure — so the card just falls
+// back to the header image instead, per buildSteamContainer.
+async function getSteamVideoAttachment(info, maxBytes, filename) {
+  if (!info.dashManifestUrl) return null;
+
+  try {
+    const mpdRes = await fetch(info.dashManifestUrl);
+    if (!mpdRes.ok) return null;
+    const xml = await mpdRes.text();
+
+    const representations = parseSteamVideoRepresentations(xml);
+    const representation = representations.find((r) => r.estimatedBytes <= maxBytes);
+    if (!representation) return null;
+
+    const baseUrl = info.dashManifestUrl.slice(0, info.dashManifestUrl.lastIndexOf('/') + 1);
+    return await downloadSteamVideoAttachment(baseUrl, representation, maxBytes, filename);
+  } catch {
+    return null;
+  }
+}
+
+function buildSteamContainer(info, videoAttachment) {
+  const container = new ContainerBuilder().setAccentColor(0x1b2838);
+
+  container.addTextDisplayComponents(new TextDisplayBuilder().setContent('-# 🎮 Steam'));
+  container.addTextDisplayComponents(new TextDisplayBuilder().setContent(`[**${info.name}**](${info.storeUrl})`));
+
+  if (info.description) {
+    container.addTextDisplayComponents(new TextDisplayBuilder().setContent(info.description));
+  }
+
+  const metaLines = [];
+  if (info.developers) metaLines.push(`**Developer:** ${info.developers}`);
+  if (info.publishers && info.publishers !== info.developers) metaLines.push(`**Publisher:** ${info.publishers}`);
+  if (info.price) metaLines.push(`**Price:** ${info.price}`);
+  if (metaLines.length) {
+    container.addTextDisplayComponents(new TextDisplayBuilder().setContent(metaLines.join('\n')));
+  }
+
+  // The trailer clip is the main media when it could be downloaded (see getSteamVideoAttachment);
+  // it plays natively but silently (see the comment block above that function for why there's no
+  // audio track), so that's called out explicitly rather than left to look like a bug. Falls back
+  // to the static header image — for games with no trailer, one too large for this server's
+  // attachment cap, or any download failure.
+  if (videoAttachment) {
+    container.addMediaGalleryComponents(
+      new MediaGalleryBuilder().addItems(new MediaGalleryItemBuilder().setURL(`attachment://${videoAttachment.name}`))
+    );
+    container.addTextDisplayComponents(new TextDisplayBuilder().setContent('-# 🔇 Trailer clip (no audio track)'));
+  } else if (info.headerImage) {
+    container.addMediaGalleryComponents(
+      new MediaGalleryBuilder().addItems(new MediaGalleryItemBuilder().setURL(info.headerImage))
+    );
+  }
+
+  // See the comment block above for why this is plain text, not a button.
+  container.addTextDisplayComponents(
+    new TextDisplayBuilder().setContent(`-# 🖥️ Open in Steam app: ${info.steamUri}`)
+  );
+
+  container.addActionRowComponents(
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(info.storeUrl).setEmoji('🔗').setLabel('View on Steam')
+    )
+  );
+
+  return container;
+}
+
+// Only the first few Steam links in a message get looked up — same reasoning as
+// MAX_TWEETS_TO_ENRICH/MAX_INSTAGRAM_TO_ENRICH. A lookup failure (unlisted/delisted app, API
+// error, non-app store URL) degrades per-item to the original link rather than failing the
+// whole message — Steam's own og tags still let Discord unfurl it decently on its own. A video
+// that can't be attached (too large, or the game has none at all) is NOT a per-item failure —
+// see buildSteamContainer, it just falls back to the header image within the same card.
+const MAX_STEAM_TO_ENRICH = 4;
+
+async function buildSteamCards(steamMatches, sizeCap) {
+  const containers = [];
+  const files = [];
+  const plainLinks = [];
+  const cache = new Map();
+
+  for (const [i, url] of steamMatches.entries()) {
+    if (i >= MAX_STEAM_TO_ENRICH) {
+      plainLinks.push(url);
+      continue;
+    }
+
+    if (!cache.has(url)) cache.set(url, getSteamInfo(url));
+    const info = await cache.get(url);
+
+    if (!info) {
+      plainLinks.push(url);
+      continue;
+    }
+
+    const videoAttachment = await getSteamVideoAttachment(info, sizeCap, `steam-video-${i}.mp4`);
+    if (videoAttachment) files.push(videoAttachment);
+
+    containers.push(buildSteamContainer(info, videoAttachment));
+  }
+
+  return { containers, files, plainLinks };
+}
+
 // --- Fallback path: today's plain-link + native-unfurl behavior ---
 // Used for the whole message whenever any tweet's video can't be brought in as an attachment
 // (see buildTweetCards), so video playback is never sacrificed even if our own card can't be
@@ -802,35 +1084,49 @@ async function sendViaWebhook(channel, payload) {
 // since the two callers send the result differently (webhook impersonation vs. an interaction
 // reply) and need different retry behavior around it.
 async function prepareLinkResponse(rawContent, guild) {
-  const { matchesByRule, twitterMatches, instagramMatches, modified } = findLinks(rawContent);
+  const { matchesByRule, twitterMatches, instagramMatches, steamMatches, modified } = findLinks(rawContent);
   if (!modified) return null;
 
-  // Instagram matches are stripped entirely (replaced with '') rather than left as raw text or
-  // domain-swapped inline — every Instagram link ends up represented explicitly, either as a
-  // rich container or as a converted entry in instagramResult.plainLinks (see buildPrimaryPayload
-  // and buildFallbackPayloadForPrepared). Leaving the raw link in `rewritten` too, on top of
-  // that, was a real bug: it showed both the original instagram.com link and the converted one
-  // in the same message.
+  // Instagram and Steam matches are stripped entirely (replaced with '') rather than left as raw
+  // text or domain-swapped inline — every one of their links ends up represented explicitly,
+  // either as a rich container or as a plain-link entry in the relevant result's plainLinks (see
+  // buildPrimaryPayload and buildFallbackPayloadForPrepared). Leaving the raw link in `rewritten`
+  // too, on top of that, was a real bug for Instagram: it showed both the original instagram.com
+  // link and the converted one in the same message.
   let rewritten = rawContent;
   for (const { rule, matches } of matchesByRule) {
     if (rule.name === 'twitter' || !matches.length) continue;
-    rewritten = rewritten.replace(rule.regex, rule.name === 'instagram' ? '' : rule.convert);
+    rewritten = rewritten.replace(rule.regex, rule.name === 'instagram' || rule.name === 'steam' ? '' : rule.convert);
   }
   rewritten = rewritten.replace(/\n{3,}/g, '\n\n').trim();
 
-  // Messages/links with no tweet and no Instagram post at all (just TikTok/Bluesky) skip the
+  // Messages/links with no tweet, Instagram, or Steam link at all (just TikTok/Bluesky) skip the
   // whole card/fallback system — those platforms already work fine via native unfurl and aren't
   // part of this feature, and Components-v2 text isn't confirmed to auto-unfurl links the way
   // normal content does.
   const hasTweet = twitterMatches.length > 0;
   const hasInstagram = instagramMatches.length > 0;
+  const hasSteam = steamMatches.length > 0;
   const sizeCap = getAttachmentSizeCap(guild);
 
   const tweetInfos = hasTweet ? await getTweetInfoForMatches(twitterMatches) : [];
   const cardResult = hasTweet ? await buildTweetCards(tweetInfos, sizeCap) : null;
   const instagramResult = hasInstagram ? await buildInstagramCards(instagramMatches, sizeCap) : null;
+  const steamResult = hasSteam ? await buildSteamCards(steamMatches, sizeCap) : null;
 
-  return { matchesByRule, rewritten, hasTweet, hasInstagram, tweetInfos, cardResult, instagramMatches, instagramResult };
+  return {
+    matchesByRule,
+    rewritten,
+    hasTweet,
+    hasInstagram,
+    hasSteam,
+    tweetInfos,
+    cardResult,
+    instagramMatches,
+    instagramResult,
+    steamMatches,
+    steamResult,
+  };
 }
 
 // Used only when the whole message falls back to the plain-link path (a tweet's video couldn't
@@ -838,12 +1134,17 @@ async function prepareLinkResponse(rawContent, guild) {
 // entirely, so any Instagram links — even ones that already became successful rich containers in
 // `instagramResult` — need to show up as plain links here too, or they'd vanish from the message
 // entirely (excluded from `rewritten` itself; see prepareLinkResponse).
-function buildFallbackPayloadForPrepared({ rewritten, tweetInfos, instagramMatches }) {
+function buildFallbackPayloadForPrepared({ rewritten, tweetInfos, instagramMatches, steamMatches }) {
   const payload = buildFallbackPayload(rewritten, tweetInfos);
-  if (!instagramMatches?.length) return payload;
 
-  const instagramLinks = instagramMatches.map((url) => INSTAGRAM_RULE.convert(url)).join('\n');
-  return { ...payload, content: payload.content ? `${payload.content}\n${instagramLinks}` : instagramLinks };
+  const extraLinks = [
+    ...(instagramMatches?.length ? instagramMatches.map((url) => INSTAGRAM_RULE.convert(url)) : []),
+    ...(steamMatches ?? []),
+  ];
+  if (!extraLinks.length) return payload;
+
+  const joined = extraLinks.join('\n');
+  return { ...payload, content: payload.content ? `${payload.content}\n${joined}` : joined };
 }
 
 // The primary (best-case) payload for a prepared response: rich Components-v2 cards for tweets
@@ -851,29 +1152,42 @@ function buildFallbackPayloadForPrepared({ rewritten, tweetInfos, instagramMatch
 // caller has already handled cardResult.ok === false (a tweet video that couldn't be attached)
 // by using buildFallbackPayload instead — that failure mode is Twitter-specific and whole-
 // message; Instagram never triggers it (see buildInstagramCards for why).
-function buildPrimaryPayload({ matchesByRule, rewritten, hasTweet, hasInstagram, cardResult, instagramResult }) {
+function buildPrimaryPayload({
+  matchesByRule,
+  rewritten,
+  hasTweet,
+  hasInstagram,
+  hasSteam,
+  cardResult,
+  instagramResult,
+  steamResult,
+}) {
   const tweetContainers = hasTweet ? cardResult.containers : [];
   const tweetFiles = hasTweet ? cardResult.files : [];
   const instagramContainers = hasInstagram ? instagramResult.containers : [];
   const instagramFiles = hasInstagram ? instagramResult.files : [];
   const instagramPlainLinks = hasInstagram ? instagramResult.plainLinks : [];
+  const steamContainers = hasSteam ? steamResult.containers : [];
+  const steamFiles = hasSteam ? steamResult.files : [];
+  const steamPlainLinks = hasSteam ? steamResult.plainLinks : [];
 
-  const containers = [...tweetContainers, ...instagramContainers];
+  const containers = [...tweetContainers, ...instagramContainers, ...steamContainers];
+  const allPlainLinks = [...instagramPlainLinks, ...steamPlainLinks];
 
-  // Nothing rich to show (no tweet, and every Instagram link in the batch degraded to a plain
-  // link) — fall back to plain content rather than forcing everything through Components v2
-  // just to hold a text-only links container, since that path isn't confirmed to auto-unfurl
-  // links the way normal message content does. Make sure the degraded Instagram links (which
-  // were deliberately excluded from `rewritten` above) actually make it into this content.
+  // Nothing rich to show (no tweet, and every Instagram/Steam link in the batch degraded to a
+  // plain link) — fall back to plain content rather than forcing everything through Components
+  // v2 just to hold a text-only links container, since that path isn't confirmed to auto-unfurl
+  // links the way normal message content does. Make sure the degraded links (which were
+  // deliberately excluded from `rewritten` above) actually make it into this content.
   if (containers.length === 0) {
-    return { content: instagramPlainLinks.length ? `${rewritten}\n${instagramPlainLinks.join('\n')}`.trim() : rewritten };
+    return { content: allPlainLinks.length ? `${rewritten}\n${allPlainLinks.join('\n')}`.trim() : rewritten };
   }
 
-  const extraLinks = buildExtraLinksContainer(matchesByRule, instagramPlainLinks);
+  const extraLinks = buildExtraLinksContainer(matchesByRule, allPlainLinks);
   return {
     flags: MessageFlags.IsComponentsV2,
     components: extraLinks ? [...containers, extraLinks] : containers,
-    files: [...tweetFiles, ...instagramFiles],
+    files: [...tweetFiles, ...instagramFiles, ...steamFiles],
   };
 }
 
@@ -968,7 +1282,7 @@ client.on('messageCreate', async (message) => {
 // get this bot's functionality in a DM or in a server it hasn't been added to as a member.
 const fixCommand = new SlashCommandBuilder()
   .setName('fix')
-  .setDescription('Fix a Twitter/X, Instagram, TikTok, or Bluesky link')
+  .setDescription('Fix a Twitter/X, Instagram, TikTok, or Bluesky link, or build a card for a Steam store link')
   .addStringOption((option) =>
     option.setName('link').setDescription('The link to fix').setRequired(true)
   )
@@ -994,7 +1308,7 @@ client.on('interactionCreate', async (interaction) => {
   const prepared = await prepareLinkResponse(link, interaction.guild);
   if (!prepared) {
     await interaction.reply({
-      content: "That doesn't look like a supported link (Twitter/X, Instagram, TikTok, or Bluesky).",
+      content: "That doesn't look like a supported link (Twitter/X, Instagram, TikTok, Bluesky, or Steam store).",
       flags: MessageFlags.Ephemeral,
     });
     return;
