@@ -50,8 +50,14 @@ const LINK_RULES = [
   },
   {
     name: 'instagram',
+    // Used only as the degraded/plain-link fallback now (see buildInstagramCards) — the rich
+    // card path scrapes instagram7.com directly instead. This used to point at kkinstagram.com,
+    // but that domain stopped resolving entirely (confirmed live: DNS failure, not just broken)
+    // partway through this project's development — a real-time illustration of how unstable
+    // this whole ecosystem of unofficial fixers is. instagram7.com is the same host the rich
+    // card already depends on, so this doesn't add a new point of failure.
     regex: /(?<![a-zA-Z0-9])(https?:\/\/)?(www\.)?instagram\.com\/(\S+)/gi,
-    convert: (url) => url.replace(/https?:\/\/(www\.)?instagram\.com/, 'https://kkinstagram.com'),
+    convert: (url) => url.replace(/https?:\/\/(www\.)?instagram\.com/, 'https://instagram7.com'),
   },
   {
     name: 'tiktok',
@@ -73,10 +79,12 @@ const LINK_RULES = [
 ];
 
 const TWITTER_RULE = LINK_RULES.find((rule) => rule.name === 'twitter');
+const INSTAGRAM_RULE = LINK_RULES.find((rule) => rule.name === 'instagram');
 
-// Finds every social link in a message. Twitter/X matches are also returned separately (still
-// in their original, unconverted form) since those need async per-tweet handling (translation,
-// video, rich cards) before the final message can be built.
+// Finds every social link in a message. Twitter/X and Instagram matches are also returned
+// separately (still in their original, unconverted form) since those need async per-post
+// handling (translation/video/rich cards for tweets, scraped caption/media for Instagram)
+// before the final message can be built.
 function findLinks(content) {
   const matchesByRule = LINK_RULES.map((rule) => ({
     rule,
@@ -86,6 +94,7 @@ function findLinks(content) {
   return {
     matchesByRule,
     twitterMatches: matchesByRule.find((m) => m.rule.name === 'twitter').matches,
+    instagramMatches: matchesByRule.find((m) => m.rule.name === 'instagram').matches,
     modified: matchesByRule.some((m) => m.matches.length > 0),
   };
 }
@@ -256,11 +265,17 @@ function pickVideoVariant(video, maxBytes) {
 }
 
 // Downloads a video and wraps it as a Discord attachment, re-checking the real size against
-// the cap in case the bitrate-based estimate undershot it.
+// the cap in case the bitrate-based estimate undershot it (Instagram has no bitrate/duration
+// data to estimate from at all — see getInstagramInfo — so for that caller this Content-Length
+// check is the only pre-download size guard available, not just a backstop).
 async function downloadVideoAttachment(url, maxBytes, filename) {
   try {
     const res = await fetch(url);
     if (!res.ok) return null;
+
+    const contentLength = res.headers.get('content-length');
+    if (contentLength && Number(contentLength) > maxBytes) return null;
+
     const buffer = Buffer.from(await res.arrayBuffer());
     if (buffer.length > maxBytes) return null;
     return new AttachmentBuilder(buffer, { name: filename });
@@ -462,15 +477,185 @@ async function buildTweetCards(tweetInfos, sizeCap) {
   return { ok: true, containers, files };
 }
 
-// Non-Twitter links (already domain-swapped) can't be mixed into a Components-v2 message's
-// `content` field, so they're shown as a plain text block in their own small container.
-function buildExtraLinksContainer(matchesByRule) {
+// Links that never get a rich card (TikTok, Bluesky — already domain-swapped) plus any
+// Instagram links that degraded to a plain link (see buildInstagramCards) can't be mixed into a
+// Components-v2 message's `content` field, so they're shown as a plain text block in their own
+// small container instead. `extraPlainLinks` are already-converted strings, not raw matches.
+function buildExtraLinksContainer(matchesByRule, extraPlainLinks = []) {
   const links = matchesByRule
-    .filter(({ rule }) => rule.name !== 'twitter')
+    .filter(({ rule }) => rule.name !== 'twitter' && rule.name !== 'instagram')
     .flatMap(({ rule, matches }) => matches.map((raw) => rule.convert(raw)));
 
-  if (!links.length) return null;
-  return new ContainerBuilder().addTextDisplayComponents(new TextDisplayBuilder().setContent(links.join('\n')));
+  const allLinks = [...links, ...extraPlainLinks];
+  if (!allLinks.length) return null;
+  return new ContainerBuilder().addTextDisplayComponents(new TextDisplayBuilder().setContent(allLinks.join('\n')));
+}
+
+// --- Instagram rich card ---
+//
+// Unlike Twitter (a clean JSON API via api.fxtwitter.com), there's no structured API for
+// Instagram — the only currently-working data source found is instagram7.com (a maintained
+// fork of the archived InstaFix project), and it only exposes data as HTML Open Graph tags, not
+// JSON. This scrapes those tags by hand. It's inherently more fragile than the Twitter
+// integration (an HTML page's tag layout has no stability contract the way a documented JSON
+// API does), and only ever gets the single primary photo/video — there's no per-post carousel
+// data exposed this way, unlike Twitter's full photos array.
+
+const INSTAGRAM_DATA_HOST = 'https://instagram7.com';
+
+function unescapeHtml(text) {
+  return text
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+}
+
+// Parses every <meta property="..." content="..."> (or name="..."/content reversed) tag in an
+// HTML document into a flat { key: content } map. Attribute-order-independent since different
+// pages (and different tags on the same page) don't write them consistently.
+function parseMetaTags(html) {
+  const tags = {};
+  for (const tagMatch of html.matchAll(/<meta\s+[^>]*>/gi)) {
+    const attrs = {};
+    for (const attrMatch of tagMatch[0].matchAll(/(\w+(?::\w+)*)\s*=\s*"([^"]*)"/g)) {
+      attrs[attrMatch[1].toLowerCase()] = attrMatch[2];
+    }
+    const key = attrs.property || attrs.name;
+    if (key && attrs.content !== undefined) tags[key] = attrs.content;
+  }
+  return tags;
+}
+
+// Images are deliberately not shown at all right now (see getInstagramInfo) — every real image
+// source tried (instagram7.com directly, and kkinstagram.com as a fallback) turned out broken
+// or dead, so rather than risk showing wrong/placeholder/dead content, Instagram posts get a
+// text-only card (author, caption, buttons) until a working image source exists. Revisit this
+// if/when one turns up; the removed logic (a broken-placeholder detector plus a kkinstagram.com
+// redirect fallback) is straightforward to re-add at that point.
+
+// Fetches and scrapes one Instagram post's data from instagram7.com. Returns null on any
+// failure (network error, non-OK response, or nothing usable found at all — no video and no
+// author/caption either) so callers fall back to a plain link instead.
+async function getInstagramInfo(url) {
+  const path = url.replace(/^(https?:\/\/)?(www\.)?instagram\.com/i, '');
+
+  try {
+    const res = await fetch(`${INSTAGRAM_DATA_HOST}${path}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)' },
+    });
+    if (!res.ok) return null;
+
+    const tags = parseMetaTags(await res.text());
+    const getTag = (key) => (tags[key] ? unescapeHtml(tags[key]) : null);
+
+    const videoUrl = getTag('og:video');
+    const authorUrl = getTag('article:author');
+    const screenName = authorUrl
+      ? authorUrl.replace(/^(https?:\/\/)?(www\.)?instagram\.com\//i, '').replace(/\/$/, '')
+      : null;
+    // The caption lives in the image alt text, not og:description — this page doesn't set one
+    // at all, confirmed live, which is also exactly why a plain domain-swapped link never showed
+    // a caption via Discord's own unfurl (it only ever reads og:description).
+    const caption = getTag('og:image:alt') ?? getTag('twitter:image:alt') ?? '';
+
+    if (!videoUrl && !screenName && !caption) return null;
+
+    return { caption, screenName, videoUrl, postUrl: `https://instagram.com${path}` };
+  } catch {
+    return null;
+  }
+}
+
+function buildInstagramContainer(info, videoAttachment) {
+  const container = new ContainerBuilder().setAccentColor(0xe1306c);
+
+  container.addTextDisplayComponents(new TextDisplayBuilder().setContent('-# 📷 Instagram'));
+
+  if (info.screenName) {
+    const profileUrl = `https://instagram.com/${info.screenName}`;
+    container.addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(`[**@${info.screenName}**](${profileUrl})`)
+    );
+  }
+
+  if (info.caption) {
+    container.addTextDisplayComponents(new TextDisplayBuilder().setContent(info.caption));
+  }
+
+  // Video still attaches normally. For a photo post (no video — every Instagram post has some
+  // media, so reaching here with no video means it's a photo), a small note stands in for the
+  // missing image instead of just silently having no media at all. This is deliberately text,
+  // not an actual placeholder graphic: every real image URL tried so far (instagram7.com's own,
+  // and kkinstagram.com as a fallback) turned out broken or dead, so pointing at yet another
+  // external image asset here risks the exact same failure — a static, self-contained line
+  // can't break.
+  if (videoAttachment) {
+    container.addMediaGalleryComponents(
+      new MediaGalleryBuilder().addItems(new MediaGalleryItemBuilder().setURL(`attachment://${videoAttachment.name}`))
+    );
+  } else {
+    container.addTextDisplayComponents(
+      new TextDisplayBuilder().setContent('-# 🖼️ Image unsupported for now')
+    );
+  }
+
+  const buttons = [
+    new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(info.postUrl).setEmoji('🔗').setLabel('View Original'),
+  ];
+  if (info.videoUrl) {
+    buttons.push(
+      new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(info.videoUrl).setEmoji('⬇️').setLabel('Download')
+    );
+  }
+  container.addActionRowComponents(new ActionRowBuilder().addComponents(...buttons));
+
+  return container;
+}
+
+// Only the first few Instagram links in a message get scraped — same reasoning as
+// MAX_TWEETS_TO_ENRICH. Unlike a tweet video (where a video that doesn't fit falls the WHOLE
+// message back to plain-link mode, see buildTweetCards), an Instagram post that fails for any
+// reason — fetch/parse failure, video too large, or beyond the enrichment cap — degrades
+// per-item to a plain domain-swapped link instead, so one bad Instagram post doesn't take down
+// a tweet's rich card elsewhere in the same message.
+const MAX_INSTAGRAM_TO_ENRICH = 4;
+
+async function buildInstagramCards(instagramMatches, sizeCap) {
+  const containers = [];
+  const files = [];
+  const plainLinks = [];
+  const cache = new Map();
+
+  for (const [i, url] of instagramMatches.entries()) {
+    if (i >= MAX_INSTAGRAM_TO_ENRICH) {
+      plainLinks.push(INSTAGRAM_RULE.convert(url));
+      continue;
+    }
+
+    if (!cache.has(url)) cache.set(url, getInstagramInfo(url));
+    const info = await cache.get(url);
+
+    if (!info) {
+      plainLinks.push(INSTAGRAM_RULE.convert(url));
+      continue;
+    }
+
+    let videoAttachment = null;
+    if (info.videoUrl) {
+      videoAttachment = await downloadVideoAttachment(info.videoUrl, sizeCap, `instagram-video-${i}.mp4`);
+      if (!videoAttachment) {
+        plainLinks.push(INSTAGRAM_RULE.convert(url));
+        continue;
+      }
+      files.push(videoAttachment);
+    }
+
+    containers.push(buildInstagramContainer(info, videoAttachment));
+  }
+
+  return { containers, files, plainLinks };
 }
 
 // --- Fallback path: today's plain-link + native-unfurl behavior ---
@@ -617,39 +802,78 @@ async function sendViaWebhook(channel, payload) {
 // since the two callers send the result differently (webhook impersonation vs. an interaction
 // reply) and need different retry behavior around it.
 async function prepareLinkResponse(rawContent, guild) {
-  const { matchesByRule, twitterMatches, modified } = findLinks(rawContent);
+  const { matchesByRule, twitterMatches, instagramMatches, modified } = findLinks(rawContent);
   if (!modified) return null;
 
+  // Instagram matches are stripped entirely (replaced with '') rather than left as raw text or
+  // domain-swapped inline — every Instagram link ends up represented explicitly, either as a
+  // rich container or as a converted entry in instagramResult.plainLinks (see buildPrimaryPayload
+  // and buildFallbackPayloadForPrepared). Leaving the raw link in `rewritten` too, on top of
+  // that, was a real bug: it showed both the original instagram.com link and the converted one
+  // in the same message.
   let rewritten = rawContent;
   for (const { rule, matches } of matchesByRule) {
     if (rule.name === 'twitter' || !matches.length) continue;
-    rewritten = rewritten.replace(rule.regex, rule.convert);
+    rewritten = rewritten.replace(rule.regex, rule.name === 'instagram' ? '' : rule.convert);
   }
+  rewritten = rewritten.replace(/\n{3,}/g, '\n\n').trim();
 
-  // Messages/links with no tweet at all (just Instagram/TikTok/Bluesky) skip the whole
-  // card/fallback system — those platforms already work fine via native unfurl and aren't part
-  // of this feature, and Components-v2 text isn't confirmed to auto-unfurl links the way normal
-  // content does.
+  // Messages/links with no tweet and no Instagram post at all (just TikTok/Bluesky) skip the
+  // whole card/fallback system — those platforms already work fine via native unfurl and aren't
+  // part of this feature, and Components-v2 text isn't confirmed to auto-unfurl links the way
+  // normal content does.
   const hasTweet = twitterMatches.length > 0;
-  const tweetInfos = hasTweet ? await getTweetInfoForMatches(twitterMatches) : [];
+  const hasInstagram = instagramMatches.length > 0;
   const sizeCap = getAttachmentSizeCap(guild);
-  const cardResult = hasTweet ? await buildTweetCards(tweetInfos, sizeCap) : null;
 
-  return { matchesByRule, rewritten, hasTweet, tweetInfos, cardResult };
+  const tweetInfos = hasTweet ? await getTweetInfoForMatches(twitterMatches) : [];
+  const cardResult = hasTweet ? await buildTweetCards(tweetInfos, sizeCap) : null;
+  const instagramResult = hasInstagram ? await buildInstagramCards(instagramMatches, sizeCap) : null;
+
+  return { matchesByRule, rewritten, hasTweet, hasInstagram, tweetInfos, cardResult, instagramMatches, instagramResult };
 }
 
-// The primary (best-case) payload for a prepared response: the rich Components-v2 card for
-// tweets, or a plain domain-swapped link for everything else. Throws/produces cardResult.ok ===
-// false when a tweet's video couldn't be attached — callers should use buildFallbackPayload
-// instead in that case (see prepareLinkResponse's cardResult).
-function buildPrimaryPayload({ matchesByRule, rewritten, hasTweet, cardResult }) {
-  if (!hasTweet) return { content: rewritten };
+// Used only when the whole message falls back to the plain-link path (a tweet's video couldn't
+// be attached — see buildTweetCards/buildFallbackPayload). That fallback abandons Components v2
+// entirely, so any Instagram links — even ones that already became successful rich containers in
+// `instagramResult` — need to show up as plain links here too, or they'd vanish from the message
+// entirely (excluded from `rewritten` itself; see prepareLinkResponse).
+function buildFallbackPayloadForPrepared({ rewritten, tweetInfos, instagramMatches }) {
+  const payload = buildFallbackPayload(rewritten, tweetInfos);
+  if (!instagramMatches?.length) return payload;
 
-  const extraLinks = buildExtraLinksContainer(matchesByRule);
+  const instagramLinks = instagramMatches.map((url) => INSTAGRAM_RULE.convert(url)).join('\n');
+  return { ...payload, content: payload.content ? `${payload.content}\n${instagramLinks}` : instagramLinks };
+}
+
+// The primary (best-case) payload for a prepared response: rich Components-v2 cards for tweets
+// and/or Instagram posts, or a plain domain-swapped link for everything else. Assumes the
+// caller has already handled cardResult.ok === false (a tweet video that couldn't be attached)
+// by using buildFallbackPayload instead — that failure mode is Twitter-specific and whole-
+// message; Instagram never triggers it (see buildInstagramCards for why).
+function buildPrimaryPayload({ matchesByRule, rewritten, hasTweet, hasInstagram, cardResult, instagramResult }) {
+  const tweetContainers = hasTweet ? cardResult.containers : [];
+  const tweetFiles = hasTweet ? cardResult.files : [];
+  const instagramContainers = hasInstagram ? instagramResult.containers : [];
+  const instagramFiles = hasInstagram ? instagramResult.files : [];
+  const instagramPlainLinks = hasInstagram ? instagramResult.plainLinks : [];
+
+  const containers = [...tweetContainers, ...instagramContainers];
+
+  // Nothing rich to show (no tweet, and every Instagram link in the batch degraded to a plain
+  // link) — fall back to plain content rather than forcing everything through Components v2
+  // just to hold a text-only links container, since that path isn't confirmed to auto-unfurl
+  // links the way normal message content does. Make sure the degraded Instagram links (which
+  // were deliberately excluded from `rewritten` above) actually make it into this content.
+  if (containers.length === 0) {
+    return { content: instagramPlainLinks.length ? `${rewritten}\n${instagramPlainLinks.join('\n')}`.trim() : rewritten };
+  }
+
+  const extraLinks = buildExtraLinksContainer(matchesByRule, instagramPlainLinks);
   return {
     flags: MessageFlags.IsComponentsV2,
-    components: extraLinks ? [...cardResult.containers, extraLinks] : cardResult.containers,
-    files: cardResult.files,
+    components: extraLinks ? [...containers, extraLinks] : containers,
+    files: [...tweetFiles, ...instagramFiles],
   };
 }
 
@@ -660,7 +884,7 @@ client.on('messageCreate', async (message) => {
 
   const prepared = await prepareLinkResponse(message.content, message.guild);
   if (!prepared) return;
-  const { rewritten, hasTweet, tweetInfos, cardResult } = prepared;
+  const { hasTweet, cardResult } = prepared;
 
   try {
     const isThread = message.channel.isThread();
@@ -679,7 +903,7 @@ client.on('messageCreate', async (message) => {
     // for it.
     try {
       if (hasTweet && !cardResult.ok) {
-        await sendViaWebhook(webhookChannel, { ...buildFallbackPayload(rewritten, tweetInfos), ...identity });
+        await sendViaWebhook(webhookChannel, { ...buildFallbackPayloadForPrepared(prepared), ...identity });
       } else {
         await sendViaWebhook(webhookChannel, { ...buildPrimaryPayload(prepared), ...identity });
       }
@@ -691,7 +915,7 @@ client.on('messageCreate', async (message) => {
       if (hasTweet && cardResult.ok) {
         try {
           console.error('Custom card send failed, retrying with plain-link fallback:', sendError);
-          await sendViaWebhook(webhookChannel, { ...buildFallbackPayload(rewritten, tweetInfos), ...identity });
+          await sendViaWebhook(webhookChannel, { ...buildFallbackPayloadForPrepared(prepared), ...identity });
         } catch (fallbackError) {
           console.error('Fallback send also failed, leaving original in place:', fallbackError);
           await message.react('⚠️').catch(() => {});
@@ -752,12 +976,12 @@ client.on('interactionCreate', async (interaction) => {
     return;
   }
 
-  const { rewritten, hasTweet, tweetInfos, cardResult } = prepared;
+  const { hasTweet, cardResult } = prepared;
   await interaction.deferReply();
 
   try {
     if (hasTweet && !cardResult.ok) {
-      await interaction.editReply(buildFallbackPayload(rewritten, tweetInfos));
+      await interaction.editReply(buildFallbackPayloadForPrepared(prepared));
       return;
     }
 
@@ -766,7 +990,7 @@ client.on('interactionCreate', async (interaction) => {
     } catch (sendError) {
       if (hasTweet && cardResult.ok) {
         console.error('Custom card reply failed, retrying with plain-link fallback:', sendError);
-        await interaction.editReply(buildFallbackPayload(rewritten, tweetInfos));
+        await interaction.editReply(buildFallbackPayloadForPrepared(prepared));
       } else {
         throw sendError;
       }
