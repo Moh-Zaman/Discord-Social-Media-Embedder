@@ -34,30 +34,40 @@ const client = new Client({
 // every other platform here is just a plain domain swap relying on Discord's native unfurl.
 // (Reddit and Threads are deliberately not included: their known fixers — rxddit.com and
 // fixthreads.net — were tested live and are currently down/broken.)
+// Every regex below starts with (?<![a-zA-Z0-9]) — without it, plain substring matching means
+// "twitter.com" also matches inside "fxtwitter.com", "x.com" inside "fixupx.com" or "box.com",
+// "instagram.com" inside "kkinstagram.com", and "bsky.app" inside "fxbsky.app". That's a real,
+// confirmed bug: a raw fxtwitter CDN link like https://gif.fxtwitter.com/tweet_video/x.webp was
+// getting misdetected as a tweet link (matching just the "twitter.com/..." tail), deleting the
+// original message and replacing it with a broken, near-empty card since there's no /status/id
+// to look up. The lookbehind requires the domain to actually start a hostname (preceded by a
+// protocol, "www.", whitespace, or start of string), not just appear as a substring anywhere.
 const LINK_RULES = [
   {
     name: 'twitter',
-    regex: /(https?:\/\/)?(www\.)?(twitter\.com|x\.com)\/(\S+)/gi,
+    regex: /(?<![a-zA-Z0-9])(https?:\/\/)?(www\.)?(twitter\.com|x\.com)\/(\S+)/gi,
     convert: (url) => url.replace(/https?:\/\/(www\.)?(twitter\.com|x\.com)/, 'https://fixupx.com'),
   },
   {
     name: 'instagram',
-    regex: /(https?:\/\/)?(www\.)?instagram\.com\/(\S+)/gi,
+    regex: /(?<![a-zA-Z0-9])(https?:\/\/)?(www\.)?instagram\.com\/(\S+)/gi,
     convert: (url) => url.replace(/https?:\/\/(www\.)?instagram\.com/, 'https://kkinstagram.com'),
   },
   {
     name: 'tiktok',
-    regex: /(https?:\/\/)?(www\.)?tiktok\.com\/(\S+)/gi,
+    regex: /(?<![a-zA-Z0-9])(https?:\/\/)?(www\.)?tiktok\.com\/(\S+)/gi,
     convert: (url) => url.replace(/https?:\/\/(www\.)?tiktok\.com/, 'https://vt.tnktok.com'),
   },
   {
     name: 'tiktok-mobile',
-    regex: /(https?:\/\/)?(www\.)?vt.tiktok\.com\/(\S+)/gi,
-    convert: (url) => url.replace(/https?:\/\/(www\.)?vt.tiktok\.com/, 'https://vt.tnktok.com'),
+    // "vt.tiktok\.com" (only the second dot was escaped) previously let a stray character stand
+    // in for the first "." too, e.g. matching "vtXtiktok.com" — fixed alongside the lookbehind.
+    regex: /(?<![a-zA-Z0-9])(https?:\/\/)?(www\.)?vt\.tiktok\.com\/(\S+)/gi,
+    convert: (url) => url.replace(/https?:\/\/(www\.)?vt\.tiktok\.com/, 'https://vt.tnktok.com'),
   },
   {
     name: 'bluesky',
-    regex: /(https?:\/\/)?(www\.)?bsky\.app\/(\S+)/gi,
+    regex: /(?<![a-zA-Z0-9])(https?:\/\/)?(www\.)?bsky\.app\/(\S+)/gi,
     convert: (url) => url.replace(/https?:\/\/(www\.)?bsky\.app/, 'https://fxbsky.app'),
   },
 ];
